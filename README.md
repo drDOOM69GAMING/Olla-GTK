@@ -1,3 +1,5 @@
+<img width="3840" height="2160" alt="Screenshot from 2026-04-17 17-29-07" src="https://github.com/user-attachments/assets/1c484f70-4da1-418d-b629-03ddaf5b614f" />
+
 # Olla-GTK
 
 **A high-performance, native GTK3 workstation for Ollama.**
