@@ -6,6 +6,19 @@
 
 Olla-GTK is a lightweight Linux desktop client designed for users who run LLMs locally and demand deep control over their hardware. Built specifically to handle high-inference models on dedicated GPUs, it replaces heavy Electron wrappers with a streamlined, asynchronous Python core.
 
+## Extended Description
+
+Olla-GTK was born out of a need for a minimalist yet powerful interface for local large language models. While many existing tools rely on resource-heavy web technologies, Olla-GTK leverages the native performance of the GTK3 toolkit to provide a near-zero overhead experience. This ensures that your system resources remain dedicated to what matters most: the inference engine.
+
+### Performance Architecture
+The core of Olla-GTK is built on a strictly non-blocking, event-driven architecture. By utilizing Python's threading library in conjunction with the GLib main loop, the application performs heavy I/O operations—such as streaming large model responses or pulling multi-gigabyte model files—in the background. This prevents the user interface from stuttering or becoming unresponsive during high-load scenarios.
+
+### Advanced Memory and Context Management
+Managing VRAM is the primary challenge of local inference. Olla-GTK provides a transparent view into the model's context window.
+
+* **The Context Meter:** This feature calculates the approximate token usage in real-time, allowing users to visualize how close they are to the hardware limits of their GPU.
+* **Sliding-Window Logic:** To maintain long-running conversations without crashing the backend, the application implements an automated history truncation system. It intelligently removes the oldest turns in the conversation to ensure the total token count stays within the user-defined `num_ctx` limit.
+
 ## Key Features
 
 * **High-Performance Streaming:** Implements a 100ms token-batching logic. Even at high inference speeds, the UI remains responsive without locking the GTK main loop.
@@ -42,7 +55,7 @@ Olla-GTK is a single-file application requiring no external Python package depen
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/drDOOM69GAMING/Olla-GTK.git
+   git clone [https://github.com/drDOOM69GAMING/Olla-GTK.git](https://github.com/drDOOM69GAMING/Olla-GTK.git)
    cd Olla-GTK
    ```
 2. Run the script:
@@ -61,4 +74,7 @@ The settings panel allows for precise tuning of the model parameters based on yo
 
 ## License
 
-MIT License
+Copyright (c) 2026 drDOOM69GAMING
+
+This project is licensed under the **MIT License**. For the full license text, please see the [LICENSE](LICENSE) file in the repository root.
+```
