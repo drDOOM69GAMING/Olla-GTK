@@ -40,7 +40,7 @@ Olla-GTK is a single-file application requiring no external Python package depen
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/Olla-GTK.git
+   git clone https://github.com/drDOOM69GAMING/Olla-GTK.git
    cd Olla-GTK
    ```
 2. Run the script:
