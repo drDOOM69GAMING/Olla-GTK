@@ -1,3 +1,5 @@
+<img width="2032" height="1610" alt="Screenshot from 2026-04-18 15-49-25" src="https://github.com/user-attachments/assets/4f4e682b-c21f-4dd9-8545-806778b8b1bd" />
+
 # Olla-GTK
 
 **A high-performance, native GTK3 workstation for Local and Cloud AI.**
