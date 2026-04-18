@@ -1,91 +1,72 @@
-<img width="2034" height="1612" alt="Screenshot from 2026-04-18 10-32-11" src="https://github.com/user-attachments/assets/7175ac3b-a7f7-405f-b386-fa2756632a78" />
-
 # Olla-GTK
 
 **A high-performance, native GTK3 workstation for Local and Cloud AI.**
 
-Olla-GTK is a lightweight Linux desktop client designed for users who demand deep control over their AI workflows. Originally built for Ollama, it has evolved into a multi-backend workstation that handles high-inference local models alongside world-class cloud APIs (**Gemini** & **Claude**) within a single, streamlined interface.
+Olla-GTK is a lightweight Linux desktop client built for users who demand deep control over their AI workflows. Originally built for Ollama, it has evolved into a multi-backend powerhouse that balances local inference with world-class cloud APIs (**Gemini** & **Claude**) within a single, streamlined interface.
 
-## Extended Description
+## 🚀 The Native Advantage
 
-Olla-GTK replaces heavy Electron wrappers with a near-zero overhead experience. By leveraging the native performance of the GTK3 toolkit, the application ensures that your system resources remain dedicated to the inference engine—whether that’s a local GPU or high-speed cloud streaming.
+Olla-GTK replaces bloated Electron wrappers with a **zero-overhead native experience**. By leveraging Python and the GTK3 toolkit, the application ensures system resources remain dedicated to your models—not your chat interface.
 
 ### Performance Architecture
-The core of Olla-GTK is built on a strictly non-blocking, event-driven architecture. By utilizing Python's threading library in conjunction with the GLib main loop, the application performs heavy networking and I/O—such as streaming model responses or pulling multi-gigabyte model files—in the background. This prevents the UI from stuttering even during high-load scenarios.
+The core of Olla-GTK is built on a strictly **non-blocking, event-driven architecture**. By utilizing Python’s `threading` library in conjunction with the **GLib main loop**, heavy I/O—such as streaming tokens or pulling multi-gigabyte model files—happens in the background. The UI remains 60FPS-smooth even during high-load inference.
 
-### Multi-Backend & Vision Integration
-* **Unified Vision Support:** Native support for image-to-text (Multimodal) across Ollama, Gemini 1.5, and Claude 3.
-* **The Context Meter:** Calculates approximate token usage in real-time, allowing you to visualize usage against hardware or API limits.
-* **Sliding-Window Logic:** Implements automated history truncation to maintain long-running conversations without exceeding `num_ctx` or API caps.
-* **✨ Edit Mode:** A specialized workflow that hijacks the system prompt to silently copy-edit pasted text, returning only the polished version without conversational filler.
+## 🛠 Key Features
 
-## Key Features
+* **Multi-Backend Streaming:** Toggle instantly between **Ollama (Local)**, **Google Gemini**, and **Anthropic Claude**.
+* **Unified Vision Integration:** Native support for multimodal reasoning (image-to-text) across all supported providers.
+* **High-Inference Optimization:** Implements **100ms token-batching** logic, allowing the UI to handle extreme tokens-per-second (TPS) without lag.
+* **Developer-First UX:**
+    * **Smart Syntax Highlighting:** Built-in code block detection with high-contrast themes.
+    * **Direct Code Extraction:** Right-click any code block to copy the contents instantly—no manual highlighting required.
+    * **Background Model Management:** Download and verify Ollama models directly from the UI with live progress tracking.
+* **✨ Edit Mode (Auto-Editor):** A specialized workflow that transforms the AI into a silent copyeditor. Paste raw text, and get back polished, corrected content without conversational filler.
+* **Zero-Loss Recovery:** Automatically restores failed prompts to the input buffer if a network or inference error occurs.
 
-* **Multi-Backend Streaming:** Seamlessly switch between **Ollama (Local)**, **Google Gemini**, and **Anthropic Claude**.
-* **Multimodal Reasoning:** Attach images for visual analysis across all supported providers.
-* **High-Performance Streaming:** Implements 100ms token-batching logic to handle high tokens-per-second (TPS) without locking the main thread.
-* **Developer-Focused UX:**
-    * **Smart Syntax Highlighting:** Multi-language support for code blocks with high-contrast themes.
-    * **Direct Code Extraction:** Right-click any code block to copy its contents instantly—no manual highlighting required.
-    * **Background Model Management:** Download and verify local Ollama models directly from the UI with live progress tracking.
-* **Zero-Loss Recovery:** Automatically restores your prompt to the input buffer if a network or inference error occurs, preventing lost work.
-
-## Keyboard Shortcuts
+## ⌨️ Keyboard Shortcuts
 
 | Shortcut | Action |
 | :--- | :--- |
 | **Enter** | Send Message |
-| **Shift + Enter** | Insert Newline |
-| **Ctrl + L** | Clear Chat & History |
-| **Ctrl + ,** | Open Settings |
-| **Ctrl + Q** | Quit |
+| **Shift + Enter** | Insert Newline (Literal) |
+| **Ctrl + L** | Clear Chat & Reset History |
+| **Ctrl + ,** | Open Settings & API Configuration |
+| **Ctrl + Q** | Quit Application |
 
-## Technical Stack
+## 🧬 Technical Stack
 
 * **Language:** Python 3
-* **Toolkit:** GTK3 (PyGObject)
-* **API Integration:** SSE-based streaming via `urllib` (Standard library focus; zero heavy external dependencies like `requests`).
-* **Concurrency:** Multi-threaded architecture using GLib idle-handling for a completely non-blocking UI.
+* **Toolkit:** GTK3 (PyGObject) + Cairo
+* **API Strategy:** SSE-based streaming via `urllib`. 
+    * *Zero heavy external dependencies (No `requests`, `aiohttp`, or `openai-python`).*
+* **Concurrency:** Multi-threaded worker architecture with `GLib.idle_add` synchronization for thread-safe UI updates.
+* **Security:** Local configuration is stored with `0o600` permissions; API keys are managed through a secure, persistent settings layer.
 
-## Quick Start
+## 📦 Quick Start
 
 ### Prerequisites
 
-1. **Ollama** (Optional, for local inference):
-   ```bash
-   ollama serve
-   ```
-2. **Python GTK bindings**:
-   ```bash
-   # Ubuntu/Mint/Debian
-   sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
-   ```
+```bash
+# Ubuntu/Mint/Debian
+sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
+```
 
-### Installation and Usage
+### Installation
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/drDOOM69GAMING/Olla-GTK.git
-   cd Olla-GTK
-   ```
-2. Run the workstation:
-   ```bash
-   python3 Olla-GTK.py
-   ```
+1.  **Clone & Run:**
+    ```bash
+    git clone https://github.com/drDOOM69GAMING/Olla-GTK.git
+    cd Olla-GTK
+    python3 Olla-GTK.py
+    ```
 
-## Hardware & API Optimization
-
-The settings panel (**Ctrl+,**) allows for precise tuning:
-* **Context Size (num_ctx):** Scale your memory window based on available VRAM.
-* **GPU Layers (num_gpu):** Maximize offloading for faster local TPS.
-* **Cloud Integration:** Securely configure API keys and model selections for Gemini and Claude.
+2.  **Configure:** Press **Ctrl + ,** to enter your API keys for Gemini/Claude or to point the app toward your local Ollama instance.
 
 ---
 
 ## License
 
-Copyright (c) 2026 drDOOM69GAMING
-
-This project is licensed under the **MIT License**. For the full license text, please see the [LICENSE](LICENSE) file in the repository root.
+Copyright (c) 2026 drDOOM69GAMING  
+Licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
 
 ---
