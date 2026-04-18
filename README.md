@@ -1,5 +1,5 @@
+<img width="2034" height="1606" alt="Screenshot from 2026-04-18 00-53-36" src="https://github.com/user-attachments/assets/cfad607e-0433-41c6-8f56-8948d8b25408" />
 
-https://github.com/user-attachments/assets/cf42898f-8941-4aa3-b264-e6dcbf36bce7
 
 # Olla-GTK
 
