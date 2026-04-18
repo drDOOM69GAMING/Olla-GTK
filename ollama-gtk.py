@@ -25,7 +25,7 @@ New in this version:
 import gi
 gi.require_version("Gtk",      "3.0")
 gi.require_version("GdkPixbuf","2.0")
-from gi.repository import Gtk, Gdk, GLib, Pango, GdkPixbuf
+from gi.repository import Gtk, Gdk, GLib, Gio, Pango, GdkPixbuf
 
 import base64
 import enum
@@ -648,23 +648,65 @@ def _set_combo(combo: Gtk.ComboBoxText, items: list, value: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImageGenPanel(Gtk.Box):
-    """Self-contained panel that lives in the Image Gen notebook tab."""
+    """
+    Self-contained panel that lives in the Image Gen notebook tab.
 
-    SIZES = ["512×512", "768×512", "512×768", "768×768", "1024×1024"]
+    Supports two backends selectable via a radio-button row:
+      • Stable Diffusion (localhost A1111-compatible API, default)
+      • Google Gemini  (gemini-2.5-flash-image or gemini-3.1-flash-image-preview)
+
+    The Gemini backend uses the same API key stored in app.gemini_key and
+    the v1beta/generateContent endpoint with response_modalities=["IMAGE"].
+    SD-specific controls (steps, CFG, negative prompt) are shown/hidden
+    automatically based on which backend is active.
+    """
+
+    SIZES      = ["512×512", "768×512", "512×768", "768×768", "1024×1024"]
+    GEMINI_IMG = ["gemini-2.5-flash-image", "gemini-3.1-flash-image-preview"]
 
     def __init__(self, app: "OllamaChat"):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        self.app = app
+        self.app             = app
+        self._use_gemini     = False   # False = SD, True = Gemini
+        self._current_pixbuf: GdkPixbuf.Pixbuf | None = None
         self._build()
 
     def _build(self):
         # ── Left controls ────────────────────────────────────────────────
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         left.set_border_width(10)
-        left.set_size_request(340, -1)
+        left.set_size_request(360, -1)
         self.pack_start(left, False, False, 0)
 
-        left.pack_start(Gtk.Label(label="Positive prompt", xalign=0), False, False, 0)
+        # ── Backend selector ─────────────────────────────────────────────
+        backend_row = Gtk.Box(spacing=10)
+        left.pack_start(backend_row, False, False, 0)
+
+        self._rb_sd = Gtk.RadioButton.new_with_label(None, "🖥  Stable Diffusion")
+        self._rb_sd.set_active(True)
+        backend_row.pack_start(self._rb_sd, False, False, 0)
+
+        self._rb_gemini = Gtk.RadioButton.new_with_label_from_widget(
+            self._rb_sd, "✨  Gemini Image")
+        backend_row.pack_start(self._rb_gemini, False, False, 0)
+
+        self._rb_sd.connect("toggled", self._on_backend_toggled)
+        self._rb_gemini.connect("toggled", self._on_backend_toggled)
+
+        # ── Gemini model selector (hidden by default) ─────────────────────
+        self._gemini_row = Gtk.Box(spacing=6)
+        self._gemini_row.set_no_show_all(True)
+        self._gemini_model_combo = Gtk.ComboBoxText()
+        for m in self.GEMINI_IMG:
+            self._gemini_model_combo.append_text(m)
+        self._gemini_model_combo.set_active(0)
+        self._gemini_row.pack_start(
+            Gtk.Label(label="Model:", xalign=1), False, False, 0)
+        self._gemini_row.pack_start(self._gemini_model_combo, True, True, 0)
+        left.pack_start(self._gemini_row, False, False, 0)
+
+        # ── Prompt ───────────────────────────────────────────────────────
+        left.pack_start(Gtk.Label(label="Prompt", xalign=0), False, False, 0)
         pos_scroll = Gtk.ScrolledWindow()
         pos_scroll.set_min_content_height(80)
         pos_scroll.set_max_content_height(160)
@@ -676,7 +718,10 @@ class ImageGenPanel(Gtk.Box):
         pos_scroll.add(self.pos_view)
         left.pack_start(pos_scroll, False, False, 0)
 
-        left.pack_start(Gtk.Label(label="Negative prompt", xalign=0), False, False, 0)
+        # ── Negative prompt (SD-only, hidden for Gemini) ─────────────────
+        self._neg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self._neg_box.pack_start(
+            Gtk.Label(label="Negative prompt", xalign=0), False, False, 0)
         neg_scroll = Gtk.ScrolledWindow()
         neg_scroll.set_min_content_height(50)
         neg_scroll.set_max_content_height(100)
@@ -688,36 +733,37 @@ class ImageGenPanel(Gtk.Box):
         self.neg_buf.set_text(
             "blurry, low quality, ugly, deformed, watermark, text, signature")
         neg_scroll.add(self.neg_view)
-        left.pack_start(neg_scroll, False, False, 0)
+        self._neg_box.pack_start(neg_scroll, False, False, 0)
+        left.pack_start(self._neg_box, False, False, 0)
 
-        # Settings grid
-        sg = Gtk.Grid(row_spacing=6, column_spacing=8)
-        left.pack_start(sg, False, False, 0)
+        # ── SD settings grid (hidden for Gemini) ─────────────────────────
+        self._sd_grid = Gtk.Grid(row_spacing=6, column_spacing=8)
+        left.pack_start(self._sd_grid, False, False, 0)
 
-        sg.attach(Gtk.Label(label="Size", xalign=1), 0, 0, 1, 1)
+        self._sd_grid.attach(Gtk.Label(label="Size", xalign=1), 0, 0, 1, 1)
         self.size_combo = Gtk.ComboBoxText()
         for s in self.SIZES:
             self.size_combo.append_text(s)
         self.size_combo.set_active(0)
-        sg.attach(self.size_combo, 1, 0, 1, 1)
+        self._sd_grid.attach(self.size_combo, 1, 0, 1, 1)
 
-        sg.attach(Gtk.Label(label="Steps", xalign=1), 0, 1, 1, 1)
+        self._sd_grid.attach(Gtk.Label(label="Steps", xalign=1), 0, 1, 1, 1)
         self.steps_spin = Gtk.SpinButton()
         self.steps_spin.set_adjustment(
             Gtk.Adjustment(value=20, lower=1, upper=150,
                            step_increment=1, page_increment=5))
         self.steps_spin.set_digits(0)
-        sg.attach(self.steps_spin, 1, 1, 1, 1)
+        self._sd_grid.attach(self.steps_spin, 1, 1, 1, 1)
 
-        sg.attach(Gtk.Label(label="CFG scale", xalign=1), 0, 2, 1, 1)
+        self._sd_grid.attach(Gtk.Label(label="CFG scale", xalign=1), 0, 2, 1, 1)
         self.cfg_spin = Gtk.SpinButton()
         self.cfg_spin.set_adjustment(
             Gtk.Adjustment(value=7.0, lower=1.0, upper=30.0,
                            step_increment=0.5, page_increment=1.0))
         self.cfg_spin.set_digits(1)
-        sg.attach(self.cfg_spin, 1, 2, 1, 1)
+        self._sd_grid.attach(self.cfg_spin, 1, 2, 1, 1)
 
-        # Status + generate button
+        # ── Status + buttons ─────────────────────────────────────────────
         self.sd_status = Gtk.Label(label="")
         self.sd_status.set_halign(Gtk.Align.START)
         left.pack_start(self.sd_status, False, False, 0)
@@ -750,65 +796,217 @@ class ImageGenPanel(Gtk.Box):
         self._img_box.pack_start(self._img_widget, True, True, 0)
         right_scroll.add(self._img_box)
 
-        self._current_pixbuf: GdkPixbuf.Pixbuf | None = None
+    # ── Backend toggle ────────────────────────────────────────────────────
 
-    # ── Generation ────────────────────────────────────────────────────────
+    def _on_backend_toggled(self, btn):
+        if not btn.get_active():
+            return
+        self._use_gemini = self._rb_gemini.get_active()
+        # Show/hide SD-specific controls
+        if self._use_gemini:
+            self._neg_box.hide()
+            self._sd_grid.hide()
+            self._gemini_row.show()
+            self.sd_status.set_text(
+                "Gemini image — uses your Gemini API key from Settings")
+        else:
+            self._neg_box.show()
+            self._sd_grid.show()
+            self._gemini_row.hide()
+            self.sd_status.set_text("")
+
+    # ── Generation dispatcher ─────────────────────────────────────────────
 
     def _generate(self, *_):
-        s, e = self.pos_buf.get_start_iter(), self.pos_buf.get_end_iter()
+        s, e   = self.pos_buf.get_start_iter(), self.pos_buf.get_end_iter()
         prompt = self.pos_buf.get_text(s, e, False).strip()
         if not prompt:
             self.sd_status.set_text("Enter a prompt first.")
             return
-        s, e = self.neg_buf.get_start_iter(), self.neg_buf.get_end_iter()
-        neg    = self.neg_buf.get_text(s, e, False).strip()
-        size   = self.size_combo.get_active_text() or "512×512"
-        w, h   = (int(x) for x in size.replace("×", "x").split("x"))
-        steps  = int(self.steps_spin.get_value())
-        cfg    = self.cfg_spin.get_value()
 
         self.gen_btn.set_sensitive(False)
-        self.sd_status.set_text("Generating…")
-        threading.Thread(
-            target=self._gen_worker,
-            args=(prompt, neg, w, h, steps, cfg),
-            daemon=True).start()
 
-    def _gen_worker(self, prompt, neg, w, h, steps, cfg):
+        if self._use_gemini:
+            self.sd_status.set_text("Sending to Gemini…")
+            threading.Thread(
+                target=self._gen_gemini_worker, args=(prompt,),
+                daemon=True).start()
+        else:
+            s, e = self.neg_buf.get_start_iter(), self.neg_buf.get_end_iter()
+            neg  = self.neg_buf.get_text(s, e, False).strip()
+            size = self.size_combo.get_active_text() or "512×512"
+            w, h = (int(x) for x in size.replace("×", "x").split("x"))
+            self.sd_status.set_text("Generating…")
+            threading.Thread(
+                target=self._gen_sd_worker,
+                args=(prompt, neg, w, h,
+                      int(self.steps_spin.get_value()),
+                      self.cfg_spin.get_value()),
+                daemon=True).start()
+
+    # ── SD worker ─────────────────────────────────────────────────────────
+
+    def _gen_sd_worker(self, prompt, neg, w, h, steps, cfg):
         try:
             payload = json.dumps({
                 "prompt":          prompt,
                 "negative_prompt": neg,
-                "width":           w,
-                "height":          h,
-                "steps":           steps,
-                "cfg_scale":       cfg,
-                "sampler_name":    "Euler a",
+                "width":  w, "height": h,
+                "steps":  steps, "cfg_scale": cfg,
+                "sampler_name": "Euler a",
             }).encode()
             url = self.app.sd_url.rstrip("/") + "/sdapi/v1/txt2img"
             req = urllib.request.Request(
                 url, data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST")
+                headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=300) as resp:
                 data   = json.loads(resp.read().decode())
                 images = data.get("images", [])
                 if not images:
                     raise ValueError("No images returned from SD API")
-                img_bytes = base64.b64decode(images[0])
-                GLib.idle_add(self._show_image, img_bytes)
-
+                GLib.idle_add(self._show_image, base64.b64decode(images[0]))
         except Exception as ex:
-            GLib.idle_add(self.sd_status.set_text, f"Error: {ex}")
+            GLib.idle_add(self.sd_status.set_text,
+                          f"SD error: {ex}  (Is Automatic1111 running?)")
         finally:
             GLib.idle_add(self.gen_btn.set_sensitive, True)
 
+    # ── Gemini image worker ───────────────────────────────────────────────
+
+    def _gen_gemini_worker(self, prompt: str):
+        """
+        Call the Gemini generateContent endpoint with response_modalities=["IMAGE"].
+        The model returns inline_data (base64 PNG) in the first candidate's parts.
+        Uses v1beta so both stable and preview image model IDs are accepted.
+
+        429 handling: parses Google's retryDelay field and auto-retries once
+        after the specified cool-down so transient quota bursts self-heal.
+        """
+        if not self.app.gemini_key:
+            GLib.idle_add(self.sd_status.set_text,
+                          "No Gemini API key — open ⚙ Settings → Cloud APIs")
+            GLib.idle_add(self.gen_btn.set_sensitive, True)
+            return
+
+        model = self._gemini_model_combo.get_active_text() or "gemini-2.5-flash-image"
+        clean = model.split("/")[-1]
+        url   = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                 f"{clean}:generateContent?key={self.app.gemini_key}")
+
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["IMAGE"]},
+        }).encode()
+
+        max_attempts = 2   # one automatic retry after a 429 cool-down
+        for attempt in range(1, max_attempts + 1):
+            try:
+                req = urllib.request.Request(
+                    url, data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    resp_obj = urllib.request.urlopen(req, timeout=120)
+                except urllib.error.HTTPError as http_err:
+                    body = http_err.read().decode(errors="replace")
+                    try:
+                        err_json   = json.loads(body)
+                        err_obj    = (err_json[0]["error"]
+                                      if isinstance(err_json, list)
+                                      else err_json.get("error", {}))
+                        google_msg = err_obj.get("message", body)
+
+                        # ── "Limit 0" quota bug diagnosis ─────────────────
+                        # Google aliases some model IDs to internal preview
+                        # variants that have a hardcoded free-tier quota of 0.
+                        # Surface a human-readable hint rather than a raw 429.
+                        if http_err.code == 429:
+                            # Parse the retryDelay e.g. "14.48s" → 15 seconds
+                            retry_info = (err_obj.get("details") or [{}])
+                            retry_secs = 0
+                            for detail in retry_info:
+                                delay_str = detail.get("retryDelay", "")
+                                if delay_str:
+                                    try:
+                                        retry_secs = int(
+                                            float(delay_str.rstrip("s")) + 1)
+                                    except ValueError:
+                                        retry_secs = 15
+
+                            if "limit: 0" in google_msg or "RESOURCE_EXHAUSTED" in google_msg:
+                                # Permanent "Limit 0" — retrying won't help
+                                hint = (
+                                    f"Quota limit 0 on {clean} — try switching "
+                                    "to gemini-3.1-flash-image-preview, or enable "
+                                    "Image Generation in AI Studio key settings")
+                                print(f"[Gemini 429 Limit-0] {google_msg}", flush=True)
+                                GLib.idle_add(self.sd_status.set_text, hint)
+                                return  # no point retrying a hard zero quota
+
+                            if attempt < max_attempts and retry_secs > 0:
+                                # Transient rate-limit — wait and retry once
+                                print(f"[Gemini 429] retrying in {retry_secs}s…",
+                                      flush=True)
+                                for remaining in range(retry_secs, 0, -1):
+                                    GLib.idle_add(
+                                        self.sd_status.set_text,
+                                        f"Rate limited — retrying in {remaining}s…")
+                                    time.sleep(1)
+                                continue   # jump to next attempt
+
+                    except Exception:
+                        google_msg = http_err.reason
+
+                    print(f"[Gemini Image HTTPError {http_err.code}] {google_msg}",
+                          flush=True)
+                    GLib.idle_add(self.sd_status.set_text,
+                                  f"Gemini {http_err.code}: {google_msg}")
+                    return
+
+                with resp_obj as resp:
+                    data = json.loads(resp.read().decode())
+
+                # Walk parts looking for inline_data (the image bytes)
+                img_bytes = None
+                for part in (data.get("candidates", [{}])[0]
+                                 .get("content", {})
+                                 .get("parts", [])):
+                    if "inlineData" in part:
+                        img_bytes = base64.b64decode(part["inlineData"]["data"])
+                        break
+                    if "inline_data" in part:
+                        img_bytes = base64.b64decode(part["inline_data"]["data"])
+                        break
+
+                if img_bytes:
+                    GLib.idle_add(self._show_image, img_bytes)
+                else:
+                    text_parts = [p.get("text", "") for p in
+                                  (data.get("candidates", [{}])[0]
+                                       .get("content", {})
+                                       .get("parts", []))]
+                    GLib.idle_add(self.sd_status.set_text,
+                                  "No image in response: "
+                                  + " ".join(text_parts)[:120])
+                return   # success — exit the retry loop
+
+            except Exception as ex:
+                GLib.idle_add(self.sd_status.set_text, f"Error: {ex}")
+                return
+
+        GLib.idle_add(self.sd_status.set_text,
+                      "Still rate-limited after retry — wait a minute and try again")
+        GLib.idle_add(self.gen_btn.set_sensitive, True)
+
     def _show_image(self, img_bytes: bytes):
+        """
+        Display decoded image bytes in the Gtk.Image widget.
+        Uses Gio.MemoryInputStream + Pixbuf.new_from_stream — the GTK-native
+        path that avoids the write/close dance of PixbufLoader.
+        Called on the GTK main thread via GLib.idle_add.
+        """
         try:
-            loader = GdkPixbuf.PixbufLoader()
-            loader.write(img_bytes)
-            loader.close()
-            pixbuf = loader.get_pixbuf()
+            stream  = Gio.MemoryInputStream.new_from_data(img_bytes, None)
+            pixbuf  = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
             self._current_pixbuf = pixbuf
             self._img_widget.set_from_pixbuf(pixbuf)
             self.sd_status.set_text(
