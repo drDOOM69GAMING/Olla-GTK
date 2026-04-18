@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """
-Ollama Chat — GTK3 frontend  (v5 — "99% done")
+Olla-GTK  (v6 — 110% Powerhouse Edition)
 
 New in this version:
-  • Big-Brain payload: num_ctx=16384, num_predict=-1, num_gpu=99,
-    repeat_penalty=1.1 — unlocks full VRAM context for long scripts
-  • Token batching: UI updates every 100 ms instead of per-character,
-    reducing CPU/GPU chatter and coil whine on discrete GPUs
-  • Session persistence: history auto-saved to
-    ~/.config/ollama-chat/history.json on every response and on quit;
-    previous session is offered on startup
-  • Context Meter: colour-coded progress bar below the toolbar showing
-    estimated context fill (chars ÷ num_ctx×4).  Green → yellow → red.
-  • Timeout raised from 120 s → 300 s for large context pre-fills
-  • max_history default raised to 100 (let num_ctx do the real limiting)
-  • num_ctx exposed as a Settings slider (2k / 4k / 8k / 16k / 32k)
+  ┌─ Architecture ─────────────────────────────────────────────────────────────
+  │ • Backend switcher: Ollama (Local) | Google Gemini | Anthropic Claude
+  │ • Character-based sliding-window memory — never drops system prompt,
+  │   always removes oldest user+assistant pair together
+  │ • Clean callback-based streamer interface (_stream_ollama / _gemini / _claude)
+  ├─ Vision ────────────────────────────────────────────────────────────────────
+  │ • 📎 Attach Image button — file chooser filtered to images
+  │ • Image sent as base64 inline_data / images array to whichever backend
+  │ • Attachment cleared automatically after each send
+  ├─ Image Generation tab ─────────────────────────────────────────────────────
+  │ • POST to Automatic1111 / ComfyUI-A1111-compat API (localhost:7860)
+  │ • Positive + negative prompt, steps, size, CFG scale
+  │ • Result displayed as a native GTK pixbuf image widget
+  └─ Settings ──────────────────────────────────────────────────────────────────
+    • API key fields for Gemini and Claude (saved to ~/.config/ollama-chat/keys.json)
+    • Model selectors for all three backends
+    • SD server URL configurable per-session
 """
 
 import gi
-gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, GLib, Pango
+gi.require_version("Gtk",      "3.0")
+gi.require_version("GdkPixbuf","2.0")
+from gi.repository import Gtk, Gdk, GLib, Pango, GdkPixbuf
 
+import base64
+import enum
+import io
 import json
 import os
 import re
@@ -31,19 +40,34 @@ import urllib.error
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Defaults
+# Defaults & paths
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_API_URL     = "http://localhost:11434/api/chat"
-DEFAULT_SYSTEM      = ""
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_HISTORY = 100          # high count; num_ctx is the real limit
-DEFAULT_NUM_CTX     = 16384        # tokens; ~16 k fits RX 6800 16 GB easily
-DEFAULT_NUM_PREDICT = 4096         # explicit output cap; -1 can be ignored by some models
-DEFAULT_NUM_GPU     = 99           # offload all layers to VRAM
-HISTORY_PATH        = os.path.expanduser("~/.config/ollama-chat/history.json")
-REQUEST_TIMEOUT     = 300          # seconds — large ctx pre-fills can take time
-TOKEN_BATCH_MS      = 0.10         # flush token buffer every 100 ms
+DEFAULT_API_URL        = "http://localhost:11434/api/chat"
+DEFAULT_SYSTEM         = ""
+DEFAULT_TEMPERATURE    = 0.7
+DEFAULT_MAX_HISTORY    = 100
+DEFAULT_NUM_CTX        = 16384
+DEFAULT_NUM_PREDICT    = 4096
+DEFAULT_NUM_GPU        = 99
+DEFAULT_GEMINI_MODEL   = "gemini-2.0-flash"
+DEFAULT_CLAUDE_MODEL   = "claude-sonnet-4-6"
+DEFAULT_SD_URL         = "http://localhost:7860"
+
+HISTORY_PATH   = os.path.expanduser("~/.config/ollama-chat/history.json")
+KEYS_PATH      = os.path.expanduser("~/.config/ollama-chat/keys.json")
+REQUEST_TIMEOUT= 300
+TOKEN_BATCH_MS = 0.10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend enum
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Backend(enum.Enum):
+    OLLAMA = "Ollama (Local)"
+    GEMINI = "Google Gemini"
+    CLAUDE = "Anthropic Claude"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,12 +84,12 @@ def clean_text(text: str) -> str:
 
 
 def estimate_tokens(history: list[dict]) -> int:
-    """
-    Rough token estimate: 1 token ≈ 4 characters of English text.
-    Good enough for a progress bar; not a true tokeniser.
-    """
-    total_chars = sum(len(m.get("content", "")) for m in history)
-    return total_chars // 4
+    """1 token ≈ 4 chars — good enough for a progress bar."""
+    return sum(len(m.get("content", "")) for m in history) // 4
+
+
+def _ensure_config_dir():
+    os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,7 +277,7 @@ NP_THEME = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Syntax highlighter
+# Syntax highlighter  (identical to v5)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SyntaxHighlighter:
@@ -273,32 +297,23 @@ class SyntaxHighlighter:
 
         b.create_tag("code_block",
             family="Monospace", size_points=10,
-            foreground=DARK_FG,
-            background=DARK_BG_CODE,
+            foreground=DARK_FG, background=DARK_BG_CODE,
             paragraph_background=DARK_BG_CODE,
             left_margin=18, right_margin=18)
-
         b.create_tag("code_header",
             family="Monospace", size_points=9,
-            foreground=DARK_FG_DIM,
-            background=DARK_BG_HEADER,
+            foreground=DARK_FG_DIM, background=DARK_BG_HEADER,
             paragraph_background=DARK_BG_HEADER,
             left_margin=18, right_margin=18)
-
         b.create_tag("inline_code",
             family="Monospace", size_points=10,
-            foreground="#D7BA7D",
-            background=DARK_BG_INLINE)
-
+            foreground="#D7BA7D", background=DARK_BG_INLINE)
         b.create_tag("bold_text",   weight=Pango.Weight.BOLD)
         b.create_tag("bullet_item", left_margin=28)
-        b.create_tag("md_link",
-            foreground="#3794FF",
-            underline=Pango.Underline.SINGLE)
+        b.create_tag("md_link",     foreground="#3794FF",
+                     underline=Pango.Underline.SINGLE)
         b.create_tag("thinking_placeholder",
-            foreground=DARK_FG_DIM,
-            style=Pango.Style.ITALIC)
-
+            foreground=DARK_FG_DIM, style=Pango.Style.ITALIC)
         b.create_tag("user_label",
             foreground=NP_THEME["user_fg"],
             weight=Pango.Weight.BOLD, size_points=11)
@@ -358,8 +373,7 @@ class SyntaxHighlighter:
 
         for m in _RE_BULLET.finditer(text):
             ls = buf.get_iter_at_offset(base_off + m.start())
-            le = ls.copy()
-            le.forward_to_line_end()
+            le = ls.copy(); le.forward_to_line_end()
             buf.apply_tag_by_name("bullet_item", ls, le)
 
         for m in _RE_LINK.finditer(text):
@@ -384,62 +398,162 @@ class SyntaxHighlighter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Settings popover
+# Settings popover  (extended with cloud keys + backend model selectors)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SettingsPopover(Gtk.Popover):
     CTX_OPTIONS = [2048, 4096, 8192, 16384, 32768]
 
-    def __init__(self, parent_btn, app):
+    OLLAMA_MODELS = [
+        "llama3", "llama3.1", "llama3.2",
+        "mistral", "mistral-nemo",
+        "qwen2.5", "qwen2.5-coder",
+        "codellama", "deepseek-coder",
+        "phi3", "phi4", "gemma2", "gemma3",
+        # multimodal
+        "llava", "llava:13b", "moondream",
+    ]
+    GEMINI_MODELS = [
+        "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro",
+    ]
+    CLAUDE_MODELS = [
+        "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001",
+    ]
+
+    def __init__(self, parent_btn, app: "OllamaChat"):
         super().__init__()
         self.set_relative_to(parent_btn)
         self.app = app
 
-        grid = Gtk.Grid()
-        grid.set_row_spacing(8)
-        grid.set_column_spacing(10)
-        grid.set_border_width(14)
-        self.add(grid)
+        nb = Gtk.Notebook()
+        nb.set_border_width(8)
+        self.add(nb)
+
+        nb.append_page(self._build_general_tab(), Gtk.Label(label="General"))
+        nb.append_page(self._build_cloud_tab(),   Gtk.Label(label="Cloud APIs"))
+        nb.append_page(self._build_advanced_tab(),Gtk.Label(label="Advanced"))
+
+        self.show_all()
+
+    # ── tab builders ─────────────────────────────────────────────────────
+
+    def _build_general_tab(self):
+        app = self.app
+        grid = Gtk.Grid(row_spacing=8, column_spacing=10, border_width=12)
 
         def lbl(t):
-            l = Gtk.Label(label=t)
-            l.set_halign(Gtk.Align.END)
-            return l
+            l = Gtk.Label(label=t); l.set_halign(Gtk.Align.END); return l
 
-        # API URL
-        grid.attach(lbl("API URL"), 0, 0, 1, 1)
+        # API URL (Ollama)
+        grid.attach(lbl("Ollama URL"), 0, 0, 1, 1)
         self.url_entry = Gtk.Entry()
-        self.url_entry.set_width_chars(36)
+        self.url_entry.set_width_chars(34)
         self.url_entry.set_text(app.api_url)
         grid.attach(self.url_entry, 1, 0, 2, 1)
 
+        # Ollama model
+        grid.attach(lbl("Ollama Model"), 0, 1, 1, 1)
+        self.ollama_model_combo = Gtk.ComboBoxText()
+        for m in self.OLLAMA_MODELS:
+            self.ollama_model_combo.append_text(m)
+        _set_combo(self.ollama_model_combo, self.OLLAMA_MODELS, app.model)
+        grid.attach(self.ollama_model_combo, 1, 1, 2, 1)
+
         # System prompt
-        grid.attach(lbl("System\nPrompt"), 0, 1, 1, 1)
+        grid.attach(lbl("System\nPrompt"), 0, 2, 1, 1)
         sys_scroll = Gtk.ScrolledWindow()
         sys_scroll.set_min_content_height(70)
         sys_scroll.set_max_content_height(120)
         sys_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.sys_view = Gtk.TextView()
         self.sys_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.sys_view.set_left_margin(4)
-        self.sys_view.set_right_margin(4)
+        self.sys_view.set_left_margin(4); self.sys_view.set_right_margin(4)
         self.sys_buf = self.sys_view.get_buffer()
         self.sys_buf.set_text(app.system_prompt)
         sys_scroll.add(self.sys_view)
-        grid.attach(sys_scroll, 1, 1, 2, 1)
+        grid.attach(sys_scroll, 1, 2, 2, 1)
 
         # Temperature
-        grid.attach(lbl("Temperature"), 0, 2, 1, 1)
+        grid.attach(lbl("Temperature"), 0, 3, 1, 1)
         self.temp_spin = Gtk.SpinButton()
         self.temp_spin.set_adjustment(
             Gtk.Adjustment(value=app.temperature, lower=0.0, upper=2.0,
                            step_increment=0.05, page_increment=0.1))
         self.temp_spin.set_digits(2)
-        grid.attach(self.temp_spin, 1, 2, 1, 1)
-        grid.attach(Gtk.Label(label="(0 = deterministic, 2 = creative)"), 2, 2, 1, 1)
+        grid.attach(self.temp_spin, 1, 3, 1, 1)
+        grid.attach(Gtk.Label(label="(0 = deterministic, 2 = creative)"), 2, 3, 1, 1)
 
-        # Context window size
-        grid.attach(lbl("Context Size\n(num_ctx)"), 0, 3, 1, 1)
+        apply_btn = Gtk.Button(label="Apply  (clears history)")
+        apply_btn.get_style_context().add_class("send-btn")
+        apply_btn.connect("clicked", self._apply)
+        grid.attach(apply_btn, 2, 4, 1, 1)
+        return grid
+
+    def _build_cloud_tab(self):
+        app = self.app
+        grid = Gtk.Grid(row_spacing=8, column_spacing=10, border_width=12)
+
+        def lbl(t):
+            l = Gtk.Label(label=t); l.set_halign(Gtk.Align.END); return l
+
+        # Gemini
+        grid.attach(Gtk.Label(label="── Google Gemini ──────────────────────────"),
+                    0, 0, 3, 1)
+        grid.attach(lbl("API Key"), 0, 1, 1, 1)
+        self.gemini_key_entry = Gtk.Entry()
+        self.gemini_key_entry.set_visibility(False)
+        self.gemini_key_entry.set_width_chars(36)
+        self.gemini_key_entry.set_text(app.gemini_key)
+        self.gemini_key_entry.set_placeholder_text("AIza…")
+        grid.attach(self.gemini_key_entry, 1, 1, 2, 1)
+
+        grid.attach(lbl("Model"), 0, 2, 1, 1)
+        self.gemini_model_combo = Gtk.ComboBoxText()
+        for m in self.GEMINI_MODELS:
+            self.gemini_model_combo.append_text(m)
+        _set_combo(self.gemini_model_combo, self.GEMINI_MODELS, app.gemini_model)
+        grid.attach(self.gemini_model_combo, 1, 2, 2, 1)
+
+        # Claude
+        grid.attach(Gtk.Label(label="── Anthropic Claude ──────────────────────"),
+                    0, 3, 3, 1)
+        grid.attach(lbl("API Key"), 0, 4, 1, 1)
+        self.claude_key_entry = Gtk.Entry()
+        self.claude_key_entry.set_visibility(False)
+        self.claude_key_entry.set_width_chars(36)
+        self.claude_key_entry.set_text(app.claude_key)
+        self.claude_key_entry.set_placeholder_text("sk-ant-…")
+        grid.attach(self.claude_key_entry, 1, 4, 2, 1)
+
+        grid.attach(lbl("Model"), 0, 5, 1, 1)
+        self.claude_model_combo = Gtk.ComboBoxText()
+        for m in self.CLAUDE_MODELS:
+            self.claude_model_combo.append_text(m)
+        _set_combo(self.claude_model_combo, self.CLAUDE_MODELS, app.claude_model)
+        grid.attach(self.claude_model_combo, 1, 5, 2, 1)
+
+        note = Gtk.Label()
+        note.set_markup(
+            "<span foreground='#858585' size='small'>"
+            "Keys are stored locally in ~/.config/ollama-chat/keys.json</span>")
+        note.set_halign(Gtk.Align.START)
+        grid.attach(note, 0, 6, 3, 1)
+
+        apply_btn = Gtk.Button(label="Save Keys & Apply")
+        apply_btn.get_style_context().add_class("send-btn")
+        apply_btn.connect("clicked", self._apply)
+        grid.attach(apply_btn, 2, 7, 1, 1)
+        return grid
+
+    def _build_advanced_tab(self):
+        app = self.app
+        grid = Gtk.Grid(row_spacing=8, column_spacing=10, border_width=12)
+
+        def lbl(t):
+            l = Gtk.Label(label=t); l.set_halign(Gtk.Align.END); return l
+
+        # Context size
+        grid.attach(lbl("Context Size\n(num_ctx)"), 0, 0, 1, 1)
         self.ctx_combo = Gtk.ComboBoxText()
         current_idx = 0
         for i, v in enumerate(self.CTX_OPTIONS):
@@ -447,48 +561,279 @@ class SettingsPopover(Gtk.Popover):
             if v == app.num_ctx:
                 current_idx = i
         self.ctx_combo.set_active(current_idx)
-        grid.attach(self.ctx_combo, 1, 3, 1, 1)
-        grid.attach(Gtk.Label(label="↑ higher = more memory used"), 2, 3, 1, 1)
+        grid.attach(self.ctx_combo, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="↑ higher = more VRAM used"), 2, 0, 1, 1)
 
-        # Max history messages
-        grid.attach(lbl("Max History\nMessages"), 0, 4, 1, 1)
-        self.hist_spin = Gtk.SpinButton()
-        self.hist_spin.set_adjustment(
-            Gtk.Adjustment(value=app.max_history, lower=2, upper=500,
-                           step_increment=2, page_increment=10))
-        self.hist_spin.set_digits(0)
-        grid.attach(self.hist_spin, 1, 4, 1, 1)
-        grid.attach(Gtk.Label(label="messages kept (num_ctx is the real cap)"), 2, 4, 1, 1)
-
-        # Max output tokens
-        grid.attach(lbl("Max Output\n(num_predict)"), 0, 5, 1, 1)
+        # num_predict
+        grid.attach(lbl("Max Output\n(num_predict)"), 0, 1, 1, 1)
         self.predict_spin = Gtk.SpinButton()
         self.predict_spin.set_adjustment(
             Gtk.Adjustment(value=app.num_predict, lower=256, upper=32768,
                            step_increment=256, page_increment=1024))
         self.predict_spin.set_digits(0)
-        grid.attach(self.predict_spin, 1, 5, 1, 1)
-        grid.attach(Gtk.Label(label="tokens generated per response (4096 = ~3k words)"), 2, 5, 1, 1)
+        grid.attach(self.predict_spin, 1, 1, 1, 1)
+        grid.attach(Gtk.Label(label="tokens per response  (4096 ≈ 3k words)"), 2, 1, 1, 1)
 
-        apply_btn = Gtk.Button(label="Apply  (history cleared)")
+        # Max history
+        grid.attach(lbl("Max History\nMessages"), 0, 2, 1, 1)
+        self.hist_spin = Gtk.SpinButton()
+        self.hist_spin.set_adjustment(
+            Gtk.Adjustment(value=app.max_history, lower=2, upper=500,
+                           step_increment=2, page_increment=10))
+        self.hist_spin.set_digits(0)
+        grid.attach(self.hist_spin, 1, 2, 1, 1)
+        grid.attach(Gtk.Label(label="character-budget trimming is the real cap"), 2, 2, 1, 1)
+
+        # SD URL
+        grid.attach(lbl("SD API URL"), 0, 3, 1, 1)
+        self.sd_url_entry = Gtk.Entry()
+        self.sd_url_entry.set_width_chars(28)
+        self.sd_url_entry.set_text(app.sd_url)
+        grid.attach(self.sd_url_entry, 1, 3, 2, 1)
+
+        apply_btn = Gtk.Button(label="Apply  (clears history)")
         apply_btn.get_style_context().add_class("send-btn")
         apply_btn.connect("clicked", self._apply)
-        grid.attach(apply_btn, 2, 6, 1, 1)
+        grid.attach(apply_btn, 2, 4, 1, 1)
+        return grid
 
-        self.show_all()
+    # ── apply ─────────────────────────────────────────────────────────────
 
     def _apply(self, *_):
-        self.app.api_url       = self.url_entry.get_text().strip()
+        app = self.app
+        # General
+        app.api_url       = self.url_entry.get_text().strip()
         s, e = self.sys_buf.get_start_iter(), self.sys_buf.get_end_iter()
-        self.app.system_prompt = self.sys_buf.get_text(s, e, False).strip()
-        self.app.temperature   = self.temp_spin.get_value()
-        self.app.num_ctx       = self.CTX_OPTIONS[self.ctx_combo.get_active()]
-        self.app.num_predict   = int(self.predict_spin.get_value())
-        self.app.max_history   = int(self.hist_spin.get_value())
-        self.app.history.clear()
-        self.app._update_context_meter()
-        self.app._insert_sys("Settings applied — history cleared")
+        app.system_prompt = self.sys_buf.get_text(s, e, False).strip()
+        app.temperature   = self.temp_spin.get_value()
+        new_model = self.ollama_model_combo.get_active_text()
+        if new_model:
+            app.model = new_model
+
+        # Cloud
+        app.gemini_key   = self.gemini_key_entry.get_text().strip()
+        app.claude_key   = self.claude_key_entry.get_text().strip()
+        gm = self.gemini_model_combo.get_active_text()
+        cm = self.claude_model_combo.get_active_text()
+        if gm: app.gemini_model = gm
+        if cm: app.claude_model = cm
+        app._save_keys()
+
+        # Advanced
+        app.num_ctx     = self.CTX_OPTIONS[self.ctx_combo.get_active()]
+        app.num_predict = int(self.predict_spin.get_value())
+        app.max_history = int(self.hist_spin.get_value())
+        app.sd_url      = self.sd_url_entry.get_text().strip()
+
+        app.history.clear()
+        app._update_context_meter()
+        app._insert_sys("Settings applied — history cleared")
         self.popdown()
+
+
+def _set_combo(combo: Gtk.ComboBoxText, items: list, value: str):
+    """Set a ComboBoxText to the given value, or 0 if not found."""
+    for i, m in enumerate(items):
+        if m == value:
+            combo.set_active(i)
+            return
+    combo.set_active(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image Generation Panel  (Stable Diffusion / A1111 compatible)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ImageGenPanel(Gtk.Box):
+    """Self-contained panel that lives in the Image Gen notebook tab."""
+
+    SIZES = ["512×512", "768×512", "512×768", "768×768", "1024×1024"]
+
+    def __init__(self, app: "OllamaChat"):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        # ── Left controls ────────────────────────────────────────────────
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_border_width(10)
+        left.set_size_request(340, -1)
+        self.pack_start(left, False, False, 0)
+
+        left.pack_start(Gtk.Label(label="Positive prompt", xalign=0), False, False, 0)
+        pos_scroll = Gtk.ScrolledWindow()
+        pos_scroll.set_min_content_height(80)
+        pos_scroll.set_max_content_height(160)
+        pos_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.pos_view = Gtk.TextView()
+        self.pos_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.pos_view.set_left_margin(6); self.pos_view.set_right_margin(6)
+        self.pos_buf = self.pos_view.get_buffer()
+        pos_scroll.add(self.pos_view)
+        left.pack_start(pos_scroll, False, False, 0)
+
+        left.pack_start(Gtk.Label(label="Negative prompt", xalign=0), False, False, 0)
+        neg_scroll = Gtk.ScrolledWindow()
+        neg_scroll.set_min_content_height(50)
+        neg_scroll.set_max_content_height(100)
+        neg_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.neg_view = Gtk.TextView()
+        self.neg_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.neg_view.set_left_margin(6); self.neg_view.set_right_margin(6)
+        self.neg_buf = self.neg_view.get_buffer()
+        self.neg_buf.set_text(
+            "blurry, low quality, ugly, deformed, watermark, text, signature")
+        neg_scroll.add(self.neg_view)
+        left.pack_start(neg_scroll, False, False, 0)
+
+        # Settings grid
+        sg = Gtk.Grid(row_spacing=6, column_spacing=8)
+        left.pack_start(sg, False, False, 0)
+
+        sg.attach(Gtk.Label(label="Size", xalign=1), 0, 0, 1, 1)
+        self.size_combo = Gtk.ComboBoxText()
+        for s in self.SIZES:
+            self.size_combo.append_text(s)
+        self.size_combo.set_active(0)
+        sg.attach(self.size_combo, 1, 0, 1, 1)
+
+        sg.attach(Gtk.Label(label="Steps", xalign=1), 0, 1, 1, 1)
+        self.steps_spin = Gtk.SpinButton()
+        self.steps_spin.set_adjustment(
+            Gtk.Adjustment(value=20, lower=1, upper=150,
+                           step_increment=1, page_increment=5))
+        self.steps_spin.set_digits(0)
+        sg.attach(self.steps_spin, 1, 1, 1, 1)
+
+        sg.attach(Gtk.Label(label="CFG scale", xalign=1), 0, 2, 1, 1)
+        self.cfg_spin = Gtk.SpinButton()
+        self.cfg_spin.set_adjustment(
+            Gtk.Adjustment(value=7.0, lower=1.0, upper=30.0,
+                           step_increment=0.5, page_increment=1.0))
+        self.cfg_spin.set_digits(1)
+        sg.attach(self.cfg_spin, 1, 2, 1, 1)
+
+        # Status + generate button
+        self.sd_status = Gtk.Label(label="")
+        self.sd_status.set_halign(Gtk.Align.START)
+        left.pack_start(self.sd_status, False, False, 0)
+
+        self.gen_btn = Gtk.Button(label="🎨  Generate Image")
+        self.gen_btn.get_style_context().add_class("send-btn")
+        self.gen_btn.connect("clicked", self._generate)
+        left.pack_start(self.gen_btn, False, False, 0)
+
+        save_btn = Gtk.Button(label="Save Image…")
+        save_btn.get_style_context().add_class("clear-btn")
+        save_btn.connect("clicked", self._save_image)
+        left.pack_start(save_btn, False, False, 0)
+
+        # ── Right: image display ─────────────────────────────────────────
+        right_scroll = Gtk.ScrolledWindow()
+        right_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.pack_start(right_scroll, True, True, 0)
+
+        self._img_widget = Gtk.Image()
+        self._img_widget.set_halign(Gtk.Align.CENTER)
+        self._img_widget.set_valign(Gtk.Align.CENTER)
+        placeholder = Gtk.Label()
+        placeholder.set_markup(
+            f"<span foreground='{DARK_FG_DIM}'>Generated image will appear here</span>")
+        self._img_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._img_box.set_halign(Gtk.Align.CENTER)
+        self._img_box.set_valign(Gtk.Align.CENTER)
+        self._img_box.pack_start(placeholder, True, True, 0)
+        self._img_box.pack_start(self._img_widget, True, True, 0)
+        right_scroll.add(self._img_box)
+
+        self._current_pixbuf: GdkPixbuf.Pixbuf | None = None
+
+    # ── Generation ────────────────────────────────────────────────────────
+
+    def _generate(self, *_):
+        s, e = self.pos_buf.get_start_iter(), self.pos_buf.get_end_iter()
+        prompt = self.pos_buf.get_text(s, e, False).strip()
+        if not prompt:
+            self.sd_status.set_text("Enter a prompt first.")
+            return
+        s, e = self.neg_buf.get_start_iter(), self.neg_buf.get_end_iter()
+        neg    = self.neg_buf.get_text(s, e, False).strip()
+        size   = self.size_combo.get_active_text() or "512×512"
+        w, h   = (int(x) for x in size.replace("×", "x").split("x"))
+        steps  = int(self.steps_spin.get_value())
+        cfg    = self.cfg_spin.get_value()
+
+        self.gen_btn.set_sensitive(False)
+        self.sd_status.set_text("Generating…")
+        threading.Thread(
+            target=self._gen_worker,
+            args=(prompt, neg, w, h, steps, cfg),
+            daemon=True).start()
+
+    def _gen_worker(self, prompt, neg, w, h, steps, cfg):
+        try:
+            payload = json.dumps({
+                "prompt":          prompt,
+                "negative_prompt": neg,
+                "width":           w,
+                "height":          h,
+                "steps":           steps,
+                "cfg_scale":       cfg,
+                "sampler_name":    "Euler a",
+            }).encode()
+            url = self.app.sd_url.rstrip("/") + "/sdapi/v1/txt2img"
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data   = json.loads(resp.read().decode())
+                images = data.get("images", [])
+                if not images:
+                    raise ValueError("No images returned from SD API")
+                img_bytes = base64.b64decode(images[0])
+                GLib.idle_add(self._show_image, img_bytes)
+
+        except Exception as ex:
+            GLib.idle_add(self.sd_status.set_text, f"Error: {ex}")
+        finally:
+            GLib.idle_add(self.gen_btn.set_sensitive, True)
+
+    def _show_image(self, img_bytes: bytes):
+        try:
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(img_bytes)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            self._current_pixbuf = pixbuf
+            self._img_widget.set_from_pixbuf(pixbuf)
+            self.sd_status.set_text(
+                f"Done — {pixbuf.get_width()}×{pixbuf.get_height()} px")
+        except Exception as ex:
+            self.sd_status.set_text(f"Display error: {ex}")
+
+    def _save_image(self, *_):
+        if not self._current_pixbuf:
+            self.sd_status.set_text("Nothing to save yet.")
+            return
+        dialog = Gtk.FileChooserDialog(
+            title="Save Image",
+            parent=self.app,
+            action=Gtk.FileChooserAction.SAVE)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_SAVE,   Gtk.ResponseType.OK)
+        dialog.set_current_name("generated.png")
+        ff = Gtk.FileFilter(); ff.set_name("PNG images"); ff.add_pattern("*.png")
+        dialog.add_filter(ff)
+        if dialog.run() == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            if not path.endswith(".png"):
+                path += ".png"
+            self._current_pixbuf.savev(path, "png", [], [])
+            self.sd_status.set_text(f"Saved to {path}")
+        dialog.destroy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -497,21 +842,22 @@ class SettingsPopover(Gtk.Popover):
 
 class OllamaChat(Gtk.Window):
 
-    MODELS = [
+    OLLAMA_MODELS = [
         "llama3", "llama3.1", "llama3.2",
         "mistral", "mistral-nemo",
         "qwen2.5", "qwen2.5-coder",
         "codellama", "deepseek-coder",
-        "phi3", "phi4",
-        "gemma2", "gemma3",
+        "phi3", "phi4", "gemma2", "gemma3",
+        "llava", "llava:13b", "moondream",
     ]
 
     _DOTS = ["●∙∙", "∙●∙", "∙∙●"]
 
     def __init__(self):
-        super().__init__(title="Ollama Chat")
-        self.set_default_size(980, 760)
+        super().__init__(title="Olla-GTK")
+        self.set_default_size(1020, 780)
 
+        # ── Runtime settings ─────────────────────────────────────────────
         self.api_url       = DEFAULT_API_URL
         self.system_prompt = DEFAULT_SYSTEM
         self.temperature   = DEFAULT_TEMPERATURE
@@ -519,8 +865,17 @@ class OllamaChat(Gtk.Window):
         self.num_ctx       = DEFAULT_NUM_CTX
         self.num_predict   = DEFAULT_NUM_PREDICT
         self.num_gpu       = DEFAULT_NUM_GPU
+        self.sd_url        = DEFAULT_SD_URL
 
+        # Cloud backends
+        self.backend      = Backend.OLLAMA
         self.model        = "llama3"
+        self.gemini_model = DEFAULT_GEMINI_MODEL
+        self.claude_model = DEFAULT_CLAUDE_MODEL
+        self.gemini_key   = ""
+        self.claude_key   = ""
+
+        # State
         self.busy         = False
         self._cancel_flag = False
         self._resp_start: int | None = None
@@ -529,111 +884,129 @@ class OllamaChat(Gtk.Window):
         self._thinking_dot_idx  = 0
         self.history: list[dict] = []
 
+        # Image attachment (vision)
+        self.attached_image_b64:  str | None = None
+        self.attached_image_name: str        = ""
+
         self._build_ui()
         self.highlighter = SyntaxHighlighter(self.chat_buf)
         self._apply_css()
         self._set_status("ready")
         self._register_shortcuts()
+        self._load_keys()
         self.connect("destroy", self._on_quit)
-
-        # Offer to restore the last session
         GLib.idle_add(self._maybe_restore_session)
 
     # ── Persistence ───────────────────────────────────────────────────────
 
-    def _get_history_path(self) -> str:
-        folder = os.path.dirname(HISTORY_PATH)
-        os.makedirs(folder, exist_ok=True)
-        return HISTORY_PATH
-
     def _save_history(self):
         try:
-            with open(self._get_history_path(), "w", encoding="utf-8") as f:
+            _ensure_config_dir()
+            with open(HISTORY_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.history, f, ensure_ascii=False, indent=2)
         except OSError:
-            pass    # non-fatal; don't crash if disk is full or read-only
+            pass
 
     def _load_history(self) -> list[dict]:
-        path = self._get_history_path()
-        if not os.path.exists(path):
+        if not os.path.exists(HISTORY_PATH):
             return []
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, list):
-                return data
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def _save_keys(self):
+        try:
+            _ensure_config_dir()
+            with open(KEYS_PATH, "w", encoding="utf-8") as f:
+                json.dump({"gemini": self.gemini_key,
+                           "claude": self.claude_key}, f)
+        except OSError:
+            pass
+
+    def _load_keys(self):
+        if not os.path.exists(KEYS_PATH):
+            return
+        try:
+            with open(KEYS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.gemini_key = data.get("gemini", "")
+            self.claude_key = data.get("claude", "")
         except (OSError, json.JSONDecodeError):
             pass
-        return []
 
     def _maybe_restore_session(self):
         saved = self._load_history()
         if not saved:
-            return False    # GLib.idle_add won't re-schedule
-
+            return False
         n_turns = sum(1 for m in saved if m.get("role") == "user")
         dialog  = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
+            transient_for=self, modal=True,
             message_type=Gtk.MessageType.QUESTION,
             buttons=Gtk.ButtonsType.NONE,
-            text="Restore previous session?",
-        )
+            text="Restore previous session?")
         dialog.format_secondary_text(
-            f"Found {n_turns} previous turn(s) "
-            f"({estimate_tokens(saved):,} ≈ tokens).  "
-            f"Restore them into context?")
-        dialog.add_buttons(
-            "Start Fresh", Gtk.ResponseType.NO,
-            "Restore Session", Gtk.ResponseType.YES)
+            f"{n_turns} turn(s) found  (≈{estimate_tokens(saved):,} tokens).  "
+            "Restore into context?")
+        dialog.add_buttons("Start Fresh", Gtk.ResponseType.NO,
+                           "Restore Session", Gtk.ResponseType.YES)
         dialog.set_default_response(Gtk.ResponseType.YES)
-
-        resp = dialog.run()
-        dialog.destroy()
-
+        resp = dialog.run(); dialog.destroy()
         if resp == Gtk.ResponseType.YES:
             self.history = saved
-            self._insert_sys(
-                f"Session restored — {n_turns} turn(s), "
-                f"≈{estimate_tokens(self.history):,} tokens")
+            self._insert_sys(f"Session restored — {n_turns} turn(s)")
             self._update_context_meter()
-
-        return False    # don't reschedule
+        return False
 
     def _on_quit(self, *_):
         self._save_history()
         Gtk.main_quit()
 
-    # ── Context meter helpers ─────────────────────────────────────────────
+    # ── Memory: character-budget sliding window ───────────────────────────
+
+    def _trim_history_to_budget(self):
+        """
+        Remove the oldest user+assistant pairs until the total character count
+        (system prompt + history) fits within 85% of num_ctx × 4 chars.
+        The system prompt index is never stored in self.history, so it is
+        inherently protected from trimming.
+        """
+        budget = int(self.num_ctx * 4 * 0.85)
+        sys_chars = len(self.system_prompt or "You are a helpful AI assistant.")
+
+        while True:
+            hist_chars = sum(len(m.get("content", "")) for m in self.history)
+            if sys_chars + hist_chars <= budget or len(self.history) < 2:
+                break
+            # Always remove a complete pair aligned to user role at index 0
+            if self.history[0]["role"] == "user":
+                self.history = self.history[2:]
+            else:
+                # Orphaned assistant at head — remove single entry to re-align
+                self.history = self.history[1:]
+
+    # ── Context meter ─────────────────────────────────────────────────────
 
     def _update_context_meter(self):
-        """Refresh the context-fill progress bar and its label."""
-        used   = estimate_tokens(self.history)
-        cap    = self.num_ctx
-        frac   = min(used / cap, 1.0) if cap > 0 else 0.0
-
+        used  = estimate_tokens(self.history)
+        cap   = self.num_ctx
+        frac  = min(used / cap, 1.0) if cap > 0 else 0.0
         self._ctx_bar.set_fraction(frac)
-        pct = int(frac * 100)
+        pct   = int(frac * 100)
         self._ctx_label.set_markup(
             f"<span foreground='{DARK_FG_DIM}' size='small'>"
             f"Context: {used:,} / {cap:,} tokens  ({pct}%)</span>")
-
-        # Colour: green → yellow → red
-        if frac < 0.6:
-            colour = "#4EC9B0"   # teal / green
-        elif frac < 0.85:
-            colour = "#DCDCAA"   # yellow
-        else:
-            colour = "#F44747"   # red
-
-        css = f"""
-        progressbar trough {{ background-color: #333333; border-radius: 3px; }}
-        progressbar progress {{ background-color: {colour}; border-radius: 3px; }}
-        """
-        provider = Gtk.CssProvider()
-        provider.load_from_data(css.encode())
+        colour = ("#4EC9B0" if frac < 0.6
+                  else "#DCDCAA" if frac < 0.85
+                  else "#F44747")
+        css = (f"progressbar trough {{ background-color: #333333; border-radius:3px; }}"
+               f"progressbar progress {{ background-color: {colour}; border-radius:3px; }}")
+        p = Gtk.CssProvider()
+        p.load_from_data(css.encode())
         self._ctx_bar.get_style_context().add_provider(
-            provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     # ── CSS ───────────────────────────────────────────────────────────────
 
@@ -641,57 +1014,53 @@ class OllamaChat(Gtk.Window):
         css = f"""
         window, .main-box {{ background-color: {DARK_BG_PANEL}; }}
         .chat-view {{
-            font-family: 'Segoe UI', 'Ubuntu', 'Cantarell', 'Noto Sans', sans-serif;
-            font-size: 11pt;
-            background-color: {DARK_BG};
-            color: {DARK_FG};
-            caret-color: {DARK_FG};
+            font-family: 'Segoe UI','Ubuntu','Cantarell','Noto Sans',sans-serif;
+            font-size: 11pt; background-color: {DARK_BG};
+            color: {DARK_FG}; caret-color: {DARK_FG};
         }}
         .input-view {{
-            font-family: 'Segoe UI', 'Ubuntu', 'Cantarell', 'Noto Sans', sans-serif;
-            font-size: 11pt;
-            background-color: {DARK_BG_INPUT};
-            color: {DARK_FG};
-            caret-color: {DARK_FG};
+            font-family: 'Segoe UI','Ubuntu','Cantarell','Noto Sans',sans-serif;
+            font-size: 11pt; background-color: {DARK_BG_INPUT};
+            color: {DARK_FG}; caret-color: {DARK_FG};
         }}
         textview text {{ background-color: transparent; color: {DARK_FG}; }}
         .chat-view  text {{ background-color: {DARK_BG}; }}
         .input-view text {{ background-color: {DARK_BG_INPUT}; }}
         scrolledwindow, viewport {{ background-color: {DARK_BG}; }}
+        notebook {{ background-color: {DARK_BG_PANEL}; }}
+        notebook tab {{ background-color: {DARK_BG_PANEL}; padding: 4px 10px; }}
+        notebook tab:checked {{ background-color: {DARK_BG}; }}
         frame > border {{ border: 1px solid #444444; border-radius: 4px; }}
-        .toolbar-box {{ background-color: {DARK_BG_PANEL}; }}
-        .meter-box   {{ background-color: {DARK_BG_PANEL}; padding: 2px 8px 4px 8px; }}
+        .toolbar-box, .meter-box {{ background-color: {DARK_BG_PANEL}; }}
+        .meter-box {{ padding: 2px 8px 4px 8px; }}
         label {{ color: {DARK_FG}; }}
         .hint-label {{ color: {DARK_FG_DIM}; }}
+        .attach-label {{ color: #4EC9B0; font-size: 9pt; }}
         combobox button {{
             background-color: #3C3C3C; color: {DARK_FG};
             border: 1px solid #555555; border-radius: 4px;
         }}
         .send-btn {{
             background: #0E639C; color: #FFFFFF;
-            border: none; border-radius: 5px;
-            padding: 5px 16px; font-weight: bold;
+            border: none; border-radius: 5px; padding: 5px 16px; font-weight: bold;
         }}
         .send-btn:hover   {{ background: #1177BB; }}
         .send-btn:active  {{ background: #0A4D7A; }}
         .send-btn:disabled {{ background: #3C3C3C; color: #6A6A6A; }}
         .stop-btn {{
             background: #8B1A1A; color: #FFFFFF;
-            border: none; border-radius: 5px;
-            padding: 5px 16px; font-weight: bold;
+            border: none; border-radius: 5px; padding: 5px 16px; font-weight: bold;
         }}
         .stop-btn:hover  {{ background: #A52020; }}
         .stop-btn:active {{ background: #6A1010; }}
         .icon-btn {{
             background: transparent; color: {DARK_FG};
-            border: 1px solid #555555; border-radius: 5px;
-            padding: 4px 8px;
+            border: 1px solid #555555; border-radius: 5px; padding: 4px 8px;
         }}
         .icon-btn:hover {{ background: #3C3C3C; }}
         .clear-btn {{
             background: #3C3C3C; color: {DARK_FG};
-            border: 1px solid #555555;
-            border-radius: 5px; padding: 5px 10px;
+            border: 1px solid #555555; border-radius: 5px; padding: 5px 10px;
         }}
         .clear-btn:hover {{ background: #4C4C4C; }}
         separator {{ background-color: #333333; }}
@@ -699,10 +1068,9 @@ class OllamaChat(Gtk.Window):
         popover entry, popover textview {{
             background-color: {DARK_BG_INPUT}; color: {DARK_FG};
         }}
-        progressbar trough  {{ background-color: #333333; border-radius: 3px; min-height: 5px; }}
-        progressbar progress {{ background-color: #4EC9B0; border-radius: 3px; min-height: 5px; }}
+        progressbar trough  {{ background-color:#333333; border-radius:3px; min-height:5px; }}
+        progressbar progress {{ background-color:#4EC9B0; border-radius:3px; min-height:5px; }}
         """.encode()
-
         p = Gtk.CssProvider()
         p.load_from_data(css)
         Gtk.StyleContext.add_provider_for_screen(
@@ -716,15 +1084,25 @@ class OllamaChat(Gtk.Window):
         root.get_style_context().add_class("main-box")
         self.add(root)
 
-        # ── toolbar ──────────────────────────────────────────────────────
+        # ── Toolbar ───────────────────────────────────────────────────────
         toolbar = Gtk.Box(spacing=8)
         toolbar.set_border_width(8)
         toolbar.get_style_context().add_class("toolbar-box")
         root.pack_start(toolbar, False, False, 0)
 
+        # Backend switcher
+        toolbar.pack_start(Gtk.Label(label="Backend:"), False, False, 0)
+        self.backend_combo = Gtk.ComboBoxText()
+        for b in Backend:
+            self.backend_combo.append_text(b.value)
+        self.backend_combo.set_active(0)
+        self.backend_combo.connect("changed", self._on_backend_changed)
+        toolbar.pack_start(self.backend_combo, False, False, 0)
+
+        # Model selector (Ollama)
         toolbar.pack_start(Gtk.Label(label="Model:"), False, False, 0)
         self.model_combo = Gtk.ComboBoxText()
-        for m in self.MODELS:
+        for m in self.OLLAMA_MODELS:
             self.model_combo.append_text(m)
         self.model_combo.set_active(0)
         self.model_combo.connect("changed", self._on_model_changed)
@@ -746,30 +1124,41 @@ class OllamaChat(Gtk.Window):
         clear_btn.connect("clicked", self._clear)
         toolbar.pack_end(clear_btn, False, False, 0)
 
-        # ── context meter ─────────────────────────────────────────────────
+        # ── Context meter ─────────────────────────────────────────────────
         meter_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         meter_box.get_style_context().add_class("meter-box")
         root.pack_start(meter_box, False, False, 0)
-
         self._ctx_label = Gtk.Label()
         self._ctx_label.set_halign(Gtk.Align.START)
         meter_box.pack_start(self._ctx_label, False, False, 0)
-
         self._ctx_bar = Gtk.ProgressBar()
         self._ctx_bar.set_fraction(0.0)
         meter_box.pack_start(self._ctx_bar, False, False, 0)
 
         root.pack_start(Gtk.Separator(), False, False, 0)
 
-        # ── chat display ──────────────────────────────────────────────────
+        # ── Notebook: Chat | Image Gen ─────────────────────────────────────
+        self._notebook = Gtk.Notebook()
+        root.pack_start(self._notebook, True, True, 0)
+
+        self._notebook.append_page(self._build_chat_page(),
+                                   Gtk.Label(label="💬  Chat"))
+        self._img_gen_panel = ImageGenPanel(self)
+        self._notebook.append_page(self._img_gen_panel,
+                                   Gtk.Label(label="🎨  Image Gen"))
+
+        self._update_context_meter()
+
+    def _build_chat_page(self) -> Gtk.Box:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+
+        # Chat display
         self.chat_view = Gtk.TextView()
         self.chat_view.set_editable(False)
         self.chat_view.set_cursor_visible(False)
         self.chat_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.chat_view.set_left_margin(14)
-        self.chat_view.set_right_margin(14)
-        self.chat_view.set_top_margin(10)
-        self.chat_view.set_bottom_margin(10)
+        self.chat_view.set_left_margin(14); self.chat_view.set_right_margin(14)
+        self.chat_view.set_top_margin(10);  self.chat_view.set_bottom_margin(10)
         self.chat_view.get_style_context().add_class("chat-view")
         self.chat_buf = self.chat_view.get_buffer()
         self.chat_view.connect("button-press-event", self._on_chat_click)
@@ -778,19 +1167,31 @@ class OllamaChat(Gtk.Window):
         self.chat_scroll.set_vexpand(True)
         self.chat_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.chat_scroll.add(self.chat_view)
-        root.pack_start(self.chat_scroll, True, True, 0)
+        page.pack_start(self.chat_scroll, True, True, 0)
 
-        root.pack_start(Gtk.Separator(), False, False, 0)
+        page.pack_start(Gtk.Separator(), False, False, 0)
 
-        # ── input area ────────────────────────────────────────────────────
-        input_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        # ── Input area ────────────────────────────────────────────────────
+        input_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         input_outer.set_border_width(8)
         input_outer.get_style_context().add_class("toolbar-box")
-        root.pack_start(input_outer, False, False, 0)
+        page.pack_start(input_outer, False, False, 0)
 
+        # Attachment banner (hidden by default)
+        self._attach_banner = Gtk.Box(spacing=6)
+        self._attach_lbl    = Gtk.Label(label="")
+        self._attach_lbl.get_style_context().add_class("attach-label")
+        self._attach_banner.pack_start(self._attach_lbl, False, False, 0)
+        clr = Gtk.Button(label="✕  Remove")
+        clr.get_style_context().add_class("icon-btn")
+        clr.connect("clicked", self._clear_attachment)
+        self._attach_banner.pack_start(clr, False, False, 0)
+        self._attach_banner.set_no_show_all(True)
+        input_outer.pack_start(self._attach_banner, False, False, 0)
+
+        # Text input frame
         frame = Gtk.Frame()
         input_outer.pack_start(frame, False, False, 0)
-
         inp_scroll = Gtk.ScrolledWindow()
         inp_scroll.set_min_content_height(70)
         inp_scroll.set_max_content_height(220)
@@ -799,15 +1200,14 @@ class OllamaChat(Gtk.Window):
 
         self.input_view = Gtk.TextView()
         self.input_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.input_view.set_left_margin(8)
-        self.input_view.set_right_margin(8)
-        self.input_view.set_top_margin(6)
-        self.input_view.set_bottom_margin(6)
+        self.input_view.set_left_margin(8); self.input_view.set_right_margin(8)
+        self.input_view.set_top_margin(6);  self.input_view.set_bottom_margin(6)
         self.input_view.get_style_context().add_class("input-view")
         self.input_buf = self.input_view.get_buffer()
         self.input_view.connect("key-press-event", self._on_key_press)
         inp_scroll.add(self.input_view)
 
+        # Button row
         btn_row = Gtk.Box(spacing=8)
         input_outer.pack_start(btn_row, False, False, 0)
 
@@ -816,6 +1216,12 @@ class OllamaChat(Gtk.Window):
         hint.set_halign(Gtk.Align.START)
         hint.get_style_context().add_class("hint-label")
         btn_row.pack_start(hint, True, True, 0)
+
+        attach_btn = Gtk.Button(label="📎")
+        attach_btn.get_style_context().add_class("icon-btn")
+        attach_btn.set_tooltip_text("Attach image  (vision models)")
+        attach_btn.connect("clicked", self._attach_image)
+        btn_row.pack_end(attach_btn, False, False, 0)
 
         self.stop_btn = Gtk.Button(label="■ Stop")
         self.stop_btn.get_style_context().add_class("stop-btn")
@@ -828,8 +1234,7 @@ class OllamaChat(Gtk.Window):
         self.send_btn.connect("clicked", self._send)
         btn_row.pack_end(self.send_btn, False, False, 0)
 
-        # Initialise the meter display with zeroed state
-        self._update_context_meter()
+        return page
 
     # ── Global shortcuts ──────────────────────────────────────────────────
 
@@ -841,11 +1246,9 @@ class OllamaChat(Gtk.Window):
         if not ctrl:
             return False
         if event.keyval in (Gdk.KEY_l, Gdk.KEY_L):
-            self._clear()
-            return True
+            self._clear(); return True
         if event.keyval == Gdk.KEY_comma:
-            self._open_settings(self._gear_btn)
-            return True
+            self._open_settings(self._gear_btn); return True
         return False
 
     # ── Status ────────────────────────────────────────────────────────────
@@ -892,6 +1295,41 @@ class OllamaChat(Gtk.Window):
     def _open_settings(self, btn, *_):
         SettingsPopover(btn, self).popup()
 
+    # ── Image attachment ──────────────────────────────────────────────────
+
+    def _attach_image(self, *_):
+        dialog = Gtk.FileChooserDialog(
+            title="Attach Image", parent=self,
+            action=Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                           "Attach",         Gtk.ResponseType.OK)
+        ff = Gtk.FileFilter()
+        ff.set_name("Images")
+        for pat in ("*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.bmp"):
+            ff.add_pattern(pat)
+        dialog.add_filter(ff)
+        if dialog.run() == Gtk.ResponseType.OK:
+            path = dialog.get_filename()
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                self.attached_image_b64  = base64.b64encode(raw).decode()
+                self.attached_image_name = os.path.basename(path)
+                self._attach_lbl.set_text(f"📷  {self.attached_image_name}")
+                self._attach_banner.show()
+            except OSError as ex:
+                self._insert_sys(f"Could not read image: {ex}")
+        dialog.destroy()
+
+    def _clear_attachment(self, *_):
+        self.attached_image_b64  = None
+        self.attached_image_name = ""
+        self._attach_banner.hide()
+
+    def _clear_attachment_ui(self):
+        """Called from the GTK thread after a send completes."""
+        self._clear_attachment()
+
     # ── Right-click context menu ──────────────────────────────────────────
 
     def _on_chat_click(self, widget, event):
@@ -901,7 +1339,6 @@ class OllamaChat(Gtk.Window):
             Gtk.TextWindowType.WIDGET, int(event.x), int(event.y))
         result = self.chat_view.get_iter_at_location(*coords)
         it     = result[1] if isinstance(result, tuple) else result
-
         table  = self.chat_buf.get_tag_table()
         cb_tag = table.lookup("code_block")
         in_cb  = bool(cb_tag and it.has_tag(cb_tag))
@@ -920,7 +1357,6 @@ class OllamaChat(Gtk.Window):
                     .set_text(code_text, -1))
             menu.append(copy_code)
             menu.append(Gtk.SeparatorMenuItem())
-
         copy_sel = Gtk.MenuItem(label="Copy Selection")
         copy_sel.connect("activate",
                          lambda *_: self.chat_view.emit("copy-clipboard"))
@@ -931,154 +1367,119 @@ class OllamaChat(Gtk.Window):
 
     # ── Event handlers ────────────────────────────────────────────────────
 
+    def _on_backend_changed(self, w):
+        val = w.get_active_text()
+        for b in Backend:
+            if b.value == val:
+                self.backend = b
+                break
+        self._insert_sys(f"Backend: {self.backend.value}")
+        # Show/hide Ollama model combo (irrelevant for cloud backends)
+        self.model_combo.set_sensitive(self.backend == Backend.OLLAMA)
+
     def _on_model_changed(self, w):
         model_name = w.get_active_text()
         if not model_name:
             return
-
-        # If Ollama is reachable, verify the model is actually downloaded.
-        # If the server is down entirely we let it pass — the chat worker
-        # will surface a clean error when the user tries to send.
         if not self._is_model_installed(model_name):
             self._prompt_install_model(model_name)
-            return  # don't clear history or switch until install completes
-
+            return
         self.model = model_name
         self.history.clear()
         self._save_history()
         self._update_context_meter()
         self._insert_sys(f"Switched to {self.model}  (history cleared)")
 
-    # ── Model management ──────────────────────────────────────────────────
-
-    def _base_url(self) -> str:
-        """Derive the Ollama root URL from the configured api_url."""
-        # api_url is something like http://localhost:11434/api/chat
-        # Strip everything from /api onwards to get http://localhost:11434
-        idx = self.api_url.find("/api/")
-        return self.api_url[:idx] if idx != -1 else self.api_url.rstrip("/")
-
-    def _is_model_installed(self, model_name: str) -> bool:
-        """
-        Query /api/tags to see whether *model_name* is physically present.
-        Returns True on any network error (let the chat worker handle that).
-        """
-        try:
-            req = urllib.request.Request(
-                f"{self._base_url()}/api/tags",
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data      = json.loads(resp.read().decode())
-                installed = [m.get("name", "") for m in data.get("models", [])]
-                # Ollama tags models as "llama3:latest"; match on base name too
-                for inst in installed:
-                    if inst == model_name or inst.startswith(model_name + ":"):
-                        return True
-                return False
-        except Exception:
-            return True     # server unreachable — let chat attempt and fail cleanly
-
-    def _prompt_install_model(self, model_name: str):
-        """Ask the user if they want to pull the missing model."""
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            modal=True,
-            message_type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            text="Model Not Installed",
-        )
-        dialog.format_secondary_text(
-            f"'{model_name}' doesn't appear to be downloaded on this machine.\n\n"
-            "Would you like to pull (download) it from Ollama now?\n"
-            "Large models can be several GB — the download runs in the background.")
-        resp = dialog.run()
-        dialog.destroy()
-
-        if resp == Gtk.ResponseType.YES:
-            threading.Thread(
-                target=self._pull_worker, args=(model_name,), daemon=True
-            ).start()
-        else:
-            # Revert the combo box to whatever model was active before
-            for i, m in enumerate(self.MODELS):
-                if m == self.model:
-                    self.model_combo.set_active(i)
-                    break
-
-    def _pull_worker(self, model_name: str):
-        """
-        Background thread: stream /api/pull progress into the status label.
-        On success, switch the active model.  On failure, revert the combo.
-        """
-        GLib.idle_add(self.send_btn.set_sensitive, False)
-        self.busy = True
-        GLib.idle_add(self._insert_sys,
-                      f"Downloading {model_name}… this may take several minutes.")
-
-        payload = json.dumps({"name": model_name, "stream": True}).encode()
-        try:
-            req = urllib.request.Request(
-                f"{self._base_url()}/api/pull",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST")
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                line_buf = ""
-                for raw in resp:
-                    line_buf += raw.decode(errors="replace")
-                    if not line_buf.endswith("\n"):
-                        continue
-                    for line in line_buf.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj    = json.loads(line)
-                            status = obj.get("status", "")
-                            # Show download percentage when Ollama reports it
-                            total     = obj.get("total", 0)
-                            completed = obj.get("completed", 0)
-                            if total and completed:
-                                pct    = int(completed / total * 100)
-                                status = f"{status}  {pct}%"
-                            if status:
-                                GLib.idle_add(self._set_status, status)
-                        except json.JSONDecodeError:
-                            pass
-                    line_buf = ""
-
-            # ── Success ───────────────────────────────────────────────────
-            GLib.idle_add(self._insert_sys,
-                          f"✓ {model_name} installed successfully")
-            self.model = model_name
-            self.history.clear()
-            self._save_history()
-            GLib.idle_add(self._update_context_meter)
-            GLib.idle_add(self._insert_sys,
-                          f"Switched to {model_name}  (history cleared)")
-
-        except Exception as ex:
-            GLib.idle_add(self._insert_sys,
-                          f"✗ Failed to pull {model_name}: {ex}")
-            # Revert combo box to the previously active model
-            for i, m in enumerate(self.MODELS):
-                if m == self.model:
-                    GLib.idle_add(self.model_combo.set_active, i)
-                    break
-        finally:
-            self.busy = False
-            GLib.idle_add(self.send_btn.set_sensitive, True)
-            GLib.idle_add(self._set_status, "ready")
-
     def _on_key_press(self, _widget, event):
         if (event.keyval == Gdk.KEY_Return
                 and event.state & Gdk.ModifierType.CONTROL_MASK):
-            self._send()
-            return True
+            self._send(); return True
         return False
 
     def _stop_generation(self, *_):
         self._cancel_flag = True
+
+    # ── Model management (Ollama) ─────────────────────────────────────────
+
+    def _base_url(self) -> str:
+        idx = self.api_url.find("/api/")
+        return self.api_url[:idx] if idx != -1 else self.api_url.rstrip("/")
+
+    def _is_model_installed(self, model_name: str) -> bool:
+        try:
+            req = urllib.request.Request(f"{self._base_url()}/api/tags")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                for m in data.get("models", []):
+                    inst = m.get("name", "")
+                    if inst == model_name or inst.startswith(model_name + ":"):
+                        return True
+                return False
+        except Exception:
+            return True
+
+    def _prompt_install_model(self, model_name: str):
+        dialog = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text="Model Not Installed")
+        dialog.format_secondary_text(
+            f"'{model_name}' is not downloaded.  Pull it from Ollama now?")
+        resp = dialog.run(); dialog.destroy()
+        if resp == Gtk.ResponseType.YES:
+            threading.Thread(
+                target=self._pull_worker, args=(model_name,), daemon=True).start()
+        else:
+            for i, m in enumerate(self.OLLAMA_MODELS):
+                if m == self.model:
+                    self.model_combo.set_active(i); break
+
+    def _pull_worker(self, model_name: str):
+        GLib.idle_add(self.send_btn.set_sensitive, False)
+        self.busy = True
+        GLib.idle_add(self._insert_sys,
+                      f"Downloading {model_name}… this may take several minutes.")
+        payload = json.dumps({"name": model_name, "stream": True}).encode()
+        try:
+            req = urllib.request.Request(
+                f"{self._base_url()}/api/pull", data=payload,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                lbuf = ""
+                for raw in resp:
+                    lbuf += raw.decode(errors="replace")
+                    if not lbuf.endswith("\n"):
+                        continue
+                    for line in lbuf.splitlines():
+                        line = line.strip()
+                        if not line: continue
+                        try:
+                            obj    = json.loads(line)
+                            status = obj.get("status", "")
+                            total  = obj.get("total", 0)
+                            compl  = obj.get("completed", 0)
+                            if total and compl:
+                                status = f"{status}  {int(compl/total*100)}%"
+                            if status:
+                                GLib.idle_add(self._set_status, status)
+                        except json.JSONDecodeError:
+                            pass
+                    lbuf = ""
+            self.model = model_name
+            self.history.clear()
+            self._save_history()
+            GLib.idle_add(self._update_context_meter)
+            GLib.idle_add(self._insert_sys, f"✓ {model_name} installed — history cleared")
+        except Exception as ex:
+            GLib.idle_add(self._insert_sys, f"✗ Pull failed: {ex}")
+            for i, m in enumerate(self.OLLAMA_MODELS):
+                if m == self.model:
+                    GLib.idle_add(self.model_combo.set_active, i); break
+        finally:
+            self.busy = False
+            GLib.idle_add(self.send_btn.set_sensitive, True)
+            GLib.idle_add(self._set_status, "ready")
 
     # ── Thinking animation ────────────────────────────────────────────────
 
@@ -1095,8 +1496,7 @@ class OllamaChat(Gtk.Window):
         self._thinking_timer_id = GLib.timeout_add(400, self._pulse_thinking)
 
     def _pulse_thinking(self) -> bool:
-        if not self._placeholder_mark:
-            return False
+        if not self._placeholder_mark: return False
         self._thinking_dot_idx = (self._thinking_dot_idx + 1) % len(self._DOTS)
         self._replace_placeholder(self._DOTS[self._thinking_dot_idx] + "\n")
         return True
@@ -1126,17 +1526,12 @@ class OllamaChat(Gtk.Window):
     # ── Error recovery ────────────────────────────────────────────────────
 
     def _restore_prompt_on_fail(self):
-        """
-        Pop the last user turn off history and put the text back into the
-        input box so the user can retry immediately without retyping.
-        Called from the worker thread via GLib.idle_add.
-        """
         if self.history and self.history[-1]["role"] == "user":
-            failed_prompt = self.history.pop()["content"]
-            self.input_buf.set_text(failed_prompt)
+            failed = self.history.pop()["content"]
+            self.input_buf.set_text(failed)
             self._update_context_meter()
 
-    # ── Send / receive pipeline ───────────────────────────────────────────
+    # ── Send pipeline ─────────────────────────────────────────────────────
 
     def _send(self, *_):
         if self.busy:
@@ -1145,131 +1540,74 @@ class OllamaChat(Gtk.Window):
         prompt = self.input_buf.get_text(s, e, False).strip()
         if not prompt:
             return
-
         self.input_buf.set_text("")
         self.busy         = True
         self._cancel_flag = False
         self.send_btn.set_sensitive(False)
         self.stop_btn.show()
         self._set_status("thinking")
-
         self.history.append({"role": "user", "content": prompt})
         self._update_context_meter()
 
         buf = self.chat_buf
         buf.insert_with_tags_by_name(buf.get_end_iter(), "You\n", "user_label")
-        buf.insert(buf.get_end_iter(), prompt + "\n\n")
+        if self.attached_image_name:
+            buf.insert(buf.get_end_iter(),
+                       f"[📷 {self.attached_image_name}] {prompt}\n\n")
+        else:
+            buf.insert(buf.get_end_iter(), prompt + "\n\n")
         self._scroll_end()
 
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _worker(self):
-        # ── Sliding-window truncation (even-aligned to preserve pairs) ────
-        if len(self.history) > self.max_history:
-            overage = len(self.history) - self.max_history
-            overage += overage % 2
-            self.history = self.history[overage:]
+    # ── Worker: routes to the correct streaming backend ───────────────────
 
+    def _worker(self):
+        self._trim_history_to_budget()
         GLib.idle_add(self._begin_response)
 
-        messages: list[dict] = []
+        # Resolved model label for the speaker badge
+        if self.backend == Backend.OLLAMA:
+            resp_label = self.model
+        elif self.backend == Backend.GEMINI:
+            resp_label = f"Gemini ({self.gemini_model})"
+        else:
+            resp_label = f"Claude ({self.claude_model})"
 
-        # Fallback system prompt — prevents CodeLlama and other instruction-
-        # tuned models from hallucinating when they see empty <<SYS>> tags.
-        sys_prompt = self.system_prompt.strip()
-        if not sys_prompt:
-            sys_prompt = "You are a helpful and concise AI assistant."
-        messages.append({"role": "system", "content": sys_prompt})
-        messages.extend(self.history)
-
-        payload = json.dumps({
-            "model":    self.model,
-            "messages": messages,
-            "stream":   True,
-            "options":  {
-                "temperature":    self.temperature,
-                "num_ctx":        self.num_ctx,      # large context window
-                "num_predict":    self.num_predict,  # explicit cap; avoids model ignoring -1
-                "num_gpu":        self.num_gpu,      # maximise VRAM offloading
-                "repeat_penalty": 1.1,               # prevent looping
-                "top_k":          40,                # long-form generation stability
-                "top_p":          0.9,               # long-form generation stability
-            },
-        }).encode()
-
-        full_response = ""
-        first_token   = True
-        request_failed = False  # set True in except; skips polluting history
-
-        # Token batching state — flush every TOKEN_BATCH_MS seconds
+        full_response  = ""
+        first_token    = True
+        request_failed = False
         token_buffer   = ""
         last_ui_update = time.time()
 
+        def on_token(text: str):
+            nonlocal full_response, token_buffer, first_token, last_ui_update
+            full_response  += text
+            token_buffer   += text
+            now = time.time()
+            if token_buffer and (now - last_ui_update > TOKEN_BATCH_MS or first_token):
+                GLib.idle_add(self._append_token, token_buffer, first_token)
+                token_buffer   = ""
+                last_ui_update = now
+                first_token    = False
+
+        def is_cancelled() -> bool:
+            return self._cancel_flag
+
         try:
-            req = urllib.request.Request(
-                self.api_url, data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST")
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                line_buffer = ""
-                for raw_chunk in resp:
-                    if self._cancel_flag:
-                        resp.close()
-                        token_buffer  += " [stopped]"
-                        full_response += " [stopped]"
-                        GLib.idle_add(self._append_token,
-                                      token_buffer, first_token)
-                        first_token  = False
-                        token_buffer = ""
-                        break
+            if self.backend == Backend.OLLAMA:
+                self._stream_ollama(on_token, is_cancelled)
+            elif self.backend == Backend.GEMINI:
+                self._stream_gemini(on_token, is_cancelled)
+            elif self.backend == Backend.CLAUDE:
+                self._stream_claude(on_token, is_cancelled)
 
-                    line_buffer += raw_chunk.decode(errors="replace")
-                    if not line_buffer.endswith("\n"):
-                        continue
-
-                    done_signal = False
-                    for line in line_buffer.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        token = obj.get("message", {}).get("content", "")
-                        if token:
-                            token_buffer  += token
-                            full_response += token
-
-                        if obj.get("done"):
-                            done_signal = True
-
-                    line_buffer = ""
-
-                    # ── Flush buffer: either 100 ms have passed or we're done
-                    now = time.time()
-                    if token_buffer and (
-                            now - last_ui_update > TOKEN_BATCH_MS
-                            or first_token
-                            or done_signal):
-                        GLib.idle_add(self._append_token,
-                                      token_buffer, first_token)
-                        token_buffer   = ""
-                        last_ui_update = now
-                        first_token    = False
-
-                    if done_signal:
-                        break
-
-                # Flush any remaining buffered text after the loop ends
-                if token_buffer:
-                    GLib.idle_add(self._append_token,
-                                  token_buffer, first_token)
+            # Flush any remainder
+            if token_buffer:
+                GLib.idle_add(self._append_token, token_buffer, first_token)
 
         except urllib.error.URLError as ex:
-            msg = (f"[Connection error: {ex.reason}\n"
-                   "Make sure Ollama is running:  ollama serve]")
+            msg = f"[Connection error: {ex.reason}]"
             full_response = msg
             GLib.idle_add(self._append_token, msg, first_token)
             GLib.idle_add(self._restore_prompt_on_fail)
@@ -1281,20 +1619,228 @@ class OllamaChat(Gtk.Window):
             GLib.idle_add(self._restore_prompt_on_fail)
             request_failed = True
 
-        # Only persist a clean assistant reply; never write error messages into
-        # history — that would confuse the model on subsequent turns.
+        # Clear image attachment after each send (win or fail)
+        GLib.idle_add(self._clear_attachment_ui)
+
         if not request_failed:
             self.history.append({"role": "assistant", "content": full_response})
-            self._save_history()           # persist after every completed response
+            self._save_history()
+
         GLib.idle_add(self._finish_response,
                       "stopped" if self._cancel_flag else "ready")
+
+    # ── Backend streamers ─────────────────────────────────────────────────
+
+    def _stream_ollama(self, on_token, is_cancelled):
+        """Stream /api/chat on localhost Ollama."""
+        sys_prompt = (self.system_prompt.strip()
+                      or "You are a helpful and concise AI assistant.")
+
+        # Build messages — inject image into last user message if attached
+        messages = [{"role": "system", "content": sys_prompt}]
+        for i, msg in enumerate(self.history):
+            if (i == len(self.history) - 1
+                    and msg["role"] == "user"
+                    and self.attached_image_b64):
+                messages.append({
+                    "role":    "user",
+                    "content": msg["content"],
+                    "images":  [self.attached_image_b64],
+                })
+            else:
+                messages.append(msg)
+
+        payload = json.dumps({
+            "model":    self.model,
+            "messages": messages,
+            "stream":   True,
+            "options":  {
+                "temperature":    self.temperature,
+                "num_ctx":        self.num_ctx,
+                "num_predict":    self.num_predict,
+                "num_gpu":        self.num_gpu,
+                "repeat_penalty": 1.1,
+                "top_k":          40,
+                "top_p":          0.9,
+            },
+        }).encode()
+
+        req = urllib.request.Request(
+            self.api_url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            lbuf = ""
+            for raw in resp:
+                if is_cancelled():
+                    resp.close(); on_token(" [stopped]"); return
+                lbuf += raw.decode(errors="replace")
+                if not lbuf.endswith("\n"):
+                    continue
+                done = False
+                for line in lbuf.splitlines():
+                    line = line.strip()
+                    if not line: continue
+                    try:
+                        obj   = json.loads(line)
+                        token = obj.get("message", {}).get("content", "")
+                        if token:
+                            on_token(token)
+                        if obj.get("done"):
+                            done = True
+                    except json.JSONDecodeError:
+                        pass
+                lbuf = ""
+                if done:
+                    break
+
+    def _stream_gemini(self, on_token, is_cancelled):
+        """Stream Gemini via REST SSE (?alt=sse)."""
+        if not self.gemini_key:
+            on_token("[Error: No Gemini API key — open ⚙ Settings → Cloud APIs]")
+            return
+
+        sys_prompt = (self.system_prompt.strip()
+                      or "You are a helpful and concise AI assistant.")
+
+        # Convert history to Gemini format
+        contents = []
+        for i, msg in enumerate(self.history):
+            role = "model" if msg["role"] == "assistant" else "user"
+            parts = []
+            if (i == len(self.history) - 1
+                    and msg["role"] == "user"
+                    and self.attached_image_b64):
+                parts.append({"inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data":      self.attached_image_b64,
+                }})
+            parts.append({"text": msg["content"]})
+            contents.append({"role": role, "parts": parts})
+
+        payload = json.dumps({
+            "system_instruction": {"parts": [{"text": sys_prompt}]},
+            "contents":           contents,
+            "generationConfig":   {
+                "temperature":   self.temperature,
+                "maxOutputTokens": self.num_predict,
+            },
+        }).encode()
+
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{self.gemini_model}:streamGenerateContent"
+               f"?alt=sse&key={self.gemini_key}")
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            lbuf = ""
+            for raw in resp:
+                if is_cancelled():
+                    resp.close(); on_token(" [stopped]"); return
+                lbuf += raw.decode(errors="replace")
+                if not lbuf.endswith("\n"):
+                    continue
+                for line in lbuf.splitlines():
+                    line = line.strip()
+                    if not line.startswith("data: "):
+                        continue
+                    json_str = line[6:]
+                    if json_str == "[DONE]":
+                        return
+                    try:
+                        obj  = json.loads(json_str)
+                        text = (obj.get("candidates", [{}])[0]
+                                   .get("content", {})
+                                   .get("parts", [{}])[0]
+                                   .get("text", ""))
+                        if text:
+                            on_token(text)
+                    except (json.JSONDecodeError, IndexError, KeyError):
+                        pass
+                lbuf = ""
+
+    def _stream_claude(self, on_token, is_cancelled):
+        """Stream Anthropic Claude via SSE messages API."""
+        if not self.claude_key:
+            on_token("[Error: No Claude API key — open ⚙ Settings → Cloud APIs]")
+            return
+
+        sys_prompt = (self.system_prompt.strip()
+                      or "You are a helpful and concise AI assistant.")
+
+        # Convert history to Claude format (supports image content blocks)
+        messages = []
+        for i, msg in enumerate(self.history):
+            if (i == len(self.history) - 1
+                    and msg["role"] == "user"
+                    and self.attached_image_b64):
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {
+                            "type":       "base64",
+                            "media_type": "image/jpeg",
+                            "data":       self.attached_image_b64,
+                        }},
+                        {"type": "text", "text": msg["content"]},
+                    ],
+                })
+            else:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+
+        payload = json.dumps({
+            "model":      self.claude_model,
+            "system":     sys_prompt,
+            "messages":   messages,
+            "max_tokens": self.num_predict,
+            "stream":     True,
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type":      "application/json",
+                "x-api-key":         self.claude_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST")
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            lbuf = ""
+            for raw in resp:
+                if is_cancelled():
+                    resp.close(); on_token(" [stopped]"); return
+                lbuf += raw.decode(errors="replace")
+                if not lbuf.endswith("\n"):
+                    continue
+                for line in lbuf.splitlines():
+                    line = line.strip()
+                    if not line.startswith("data: "):
+                        continue
+                    json_str = line[6:]
+                    try:
+                        obj = json.loads(json_str)
+                        if obj.get("type") == "content_block_delta":
+                            text = obj.get("delta", {}).get("text", "")
+                            if text:
+                                on_token(text)
+                    except json.JSONDecodeError:
+                        pass
+                lbuf = ""
 
     # ── GTK-thread callbacks ──────────────────────────────────────────────
 
     def _begin_response(self):
+        if self.backend == Backend.OLLAMA:
+            label = self.model
+        elif self.backend == Backend.GEMINI:
+            label = f"Gemini ({self.gemini_model})"
+        else:
+            label = f"Claude ({self.claude_model})"
+
         buf = self.chat_buf
         buf.insert_with_tags_by_name(
-            buf.get_end_iter(), f"{self.model}\n", "model_label")
+            buf.get_end_iter(), f"{label}\n", "model_label")
         self._resp_start = buf.get_end_iter().get_offset()
         self._set_status("streaming")
         self._start_thinking_animation()
@@ -1308,28 +1854,22 @@ class OllamaChat(Gtk.Window):
 
     def _finish_response(self, status: str = "ready"):
         self._stop_thinking_animation()
-
         buf = self.chat_buf
         buf.insert(buf.get_end_iter(), "\n\n")
-
         if self._resp_start is not None:
-            # Pass 1: language header bars
             si       = buf.get_iter_at_offset(self._resp_start)
             raw_text = buf.get_text(si, buf.get_end_iter(), False)
             self.highlighter.insert_code_headers(self._resp_start, raw_text)
-
-            # Pass 2: syntax + markdown highlighting
             si2       = buf.get_iter_at_offset(self._resp_start)
             full_text = buf.get_text(si2, buf.get_end_iter(), False)
             self.highlighter.highlight_message(self._resp_start, full_text)
-
             self._resp_start = None
 
         self.busy = False
         self.send_btn.set_sensitive(True)
         self.stop_btn.hide()
         self._set_status(status)
-        self._update_context_meter()   # refresh meter after response lands
+        self._update_context_meter()
         self._scroll_if_at_bottom()
 
 
